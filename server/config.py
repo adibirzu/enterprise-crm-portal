@@ -4,6 +4,7 @@ import logging
 import os
 import secrets as _secrets
 from dataclasses import dataclass, field
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -174,6 +175,19 @@ class Config:
             "_".join(("OCI", "DEMO", "BACKEND", "URL")),
         )
     )
+    # Canonical env-var-named aliases — used directly in integration routes.
+    oci_demo_backend_url: str = field(
+        default_factory=lambda: _env_first(
+            "_".join(("OCI", "DEMO", "BACKEND", "URL")),
+            "PLATFORM_BACKEND_URL",
+        )
+    )
+    oci_demo_control_plane_url: str = field(
+        default_factory=lambda: _env_first(
+            "_".join(("OCI", "DEMO", "CONTROL", "PLANE", "URL")),
+            "CONTROL_PLANE_URL",
+        )
+    )
     opsi_console_url: str = field(default_factory=lambda: _env("OPSI_CONSOLE_URL"))
     db_management_console_url: str = field(default_factory=lambda: _env("DB_MANAGEMENT_CONSOLE_URL"))
     log_analytics_console_url: str = field(default_factory=lambda: _env("LOG_ANALYTICS_CONSOLE_URL"))
@@ -261,7 +275,10 @@ class Config:
             if self._database_url.startswith("postgresql://"):
                 return self._database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
             return self._database_url
-        return f"oracle+oracledb_async://{self.oracle_user}:{self.oracle_password}@"
+        return (
+            f"oracle+oracledb_async://"
+            f"{quote_plus(self.oracle_user)}:{quote_plus(self.oracle_password)}@"
+        )
 
     @property
     def database_sync_url(self) -> str:
@@ -272,7 +289,10 @@ class Config:
             if self._database_url.startswith("postgresql+asyncpg://"):
                 return self._database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
             return self._database_url
-        return f"oracle+oracledb://{self.oracle_user}:{self.oracle_password}@"
+        return (
+            f"oracle+oracledb://"
+            f"{quote_plus(self.oracle_user)}:{quote_plus(self.oracle_password)}@"
+        )
 
     @property
     def idcs_configured(self) -> bool:
