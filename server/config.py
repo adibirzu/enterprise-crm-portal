@@ -4,7 +4,7 @@ import logging
 import os
 import secrets as _secrets
 from dataclasses import dataclass, field
-from urllib.parse import quote_plus
+from urllib.parse import quote
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -277,7 +277,7 @@ class Config:
             return self._database_url
         return (
             f"oracle+oracledb_async://"
-            f"{quote_plus(self.oracle_user)}:{quote_plus(self.oracle_password)}@"
+            f"{quote(self.oracle_user, safe='')}:{quote(self.oracle_password, safe='')}@"
         )
 
     @property
@@ -291,7 +291,7 @@ class Config:
             return self._database_url
         return (
             f"oracle+oracledb://"
-            f"{quote_plus(self.oracle_user)}:{quote_plus(self.oracle_password)}@"
+            f"{quote(self.oracle_user, safe='')}:{quote(self.oracle_password, safe='')}@"
         )
 
     @property

@@ -31,9 +31,7 @@
 <!-- BEGIN shared-harness-routing -->
 ## Agent context routing
 - Global defaults come from the host. Do not re-import or reread global aliases here.
-- Read `.agent-context/project-map.md` only to locate task-specific docs, state, skills, or plugins.
 - Preserve full technical detail in agent evidence and handoffs; keep human updates brief.
 - Any commit/push/deploy step below is procedural, not standing authorization.
 - Compatibility references also retain project safety/contracts: consult matching sections before affected actions, regardless of harness.
-- CLAUDE compatibility: before using its project-specific workflow, read the relevant sections of `.agent-context/claude-specific.md`; preserve its safety and verification requirements.
 <!-- END shared-harness-routing -->
