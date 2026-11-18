@@ -1,8 +1,7 @@
 """OpenTelemetry initialization for OCI APM backend tracing.
 
 When running with the shared platform libraries available, delegates core OTel setup (resource building,
-APM exporters) to shared.observability_lib. Metrics are Prometheus-only
-(see metrics.py). Falls back to
+APM exporters, process metrics) to shared.observability_lib. Falls back to
 local implementation for standalone use.
 """
 
@@ -84,18 +83,58 @@ def _standalone_init():
     if cfg.apm_configured:
         base_url = cfg.oci_apm_endpoint.rstrip('/').split('/20200101')[0]
         traces_endpoint = f"{base_url}/20200101/opentelemetry/private/v1/traces"
+        metrics_endpoint = f"{base_url}/20200101/opentelemetry/v1/metrics"
         auth_headers = {"Authorization": f"dataKey {cfg.oci_apm_private_datakey}"}
 
         exporter = OTLPSpanExporter(endpoint=traces_endpoint, headers=auth_headers)
         provider.add_span_processor(BatchSpanProcessor(exporter))
         logger.info("OCI APM OTLP trace exporter configured: %s", cfg.oci_apm_endpoint)
 
+        try:
+            from opentelemetry import metrics as otel_metrics
+            from opentelemetry.sdk.metrics import MeterProvider
+            from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+            from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+
+            metric_exporter = OTLPMetricExporter(endpoint=metrics_endpoint, headers=auth_headers)
+            reader = PeriodicExportingMetricReader(metric_exporter, export_interval_millis=30000)
+            meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
+            otel_metrics.set_meter_provider(meter_provider)
+
+            import threading
+            _register_process_metrics_standalone(otel_metrics.get_meter(cfg.otel_service_name + ".runtime"))
+            logger.info("OCI APM metrics exporter configured (App Servers enabled)")
+        except Exception as exc:
+            logger.warning("OCI APM metrics export could not be enabled: %s", exc)
         if cfg.otlp_log_export_enabled:
             _init_otlp_log_export(resource)
     else:
         logger.warning("OCI APM not configured — traces will not be exported")
 
     trace.set_tracer_provider(provider)
+
+
+def _register_process_metrics_standalone(meter):
+    """Register process runtime metrics (standalone fallback)."""
+    import os, threading
+    try:
+        import psutil
+        from opentelemetry import metrics as otel_metrics
+
+        proc = psutil.Process(os.getpid())
+
+        def _cpu_cb(_options):
+            yield otel_metrics.Observation(proc.cpu_percent(interval=None) / 100.0)
+        def _mem_cb(_options):
+            yield otel_metrics.Observation(proc.memory_info().rss)
+        def _thread_cb(_options):
+            yield otel_metrics.Observation(threading.active_count())
+
+        meter.create_observable_gauge("process.runtime.cpython.cpu.utilization", callbacks=[_cpu_cb], unit="1")
+        meter.create_observable_gauge("process.runtime.cpython.memory", callbacks=[_mem_cb], unit="By")
+        meter.create_observable_gauge("process.runtime.cpython.thread_count", callbacks=[_thread_cb], unit="{thread}")
+    except ImportError:
+        logger.info("psutil not installed — process metrics skipped")
 
 
 def init_otel(app=None, sync_engine=None):

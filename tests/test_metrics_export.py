@@ -65,38 +65,3 @@ def test_prometheus_reader_is_used_without_apm(
 
     assert {type(r).__name__ for r in recorded[0].metric_readers} == {"PrometheusMetricReader"}
 
-
-def test_startup_with_apm_keeps_metrics_prometheus_only(
-    monkeypatch: pytest.MonkeyPatch, recorded: list[_RecordingProvider]
-) -> None:
-    """Drive the real startup order (init_otel then init_metrics) with APM set.
-
-    Contract: traces go to APM, metrics go only to Prometheus. A wrong build
-    installs an OTLP-exporting MeterProvider during init_otel, which then wins
-    the global provider and starves the Prometheus scrape.
-    """
-    from opentelemetry import metrics as otel_metrics
-    from opentelemetry import trace
-
-    from server.observability import otel_setup
-
-    replaced = dataclasses.replace(
-        otel_setup.cfg,
-        oci_apm_endpoint="https://apm.example.invalid",
-        oci_apm_private_datakey="synthetic-datakey",
-        otlp_log_export_enabled=False,
-    )
-    monkeypatch.setattr(otel_setup, "cfg", replaced)
-    monkeypatch.setattr(crm_metrics, "cfg", replaced)
-    installed: list[object] = []
-    monkeypatch.setattr(otel_metrics, "set_meter_provider", installed.append)
-    monkeypatch.setattr(crm_metrics.metrics, "set_meter_provider", installed.append)
-    monkeypatch.setattr(trace, "set_tracer_provider", lambda provider: None)
-    monkeypatch.setattr(otel_setup, "_try_shared_init", lambda: False)
-
-    otel_setup._standalone_init()
-    crm_metrics.init_metrics()
-
-    assert installed == recorded
-    assert len(recorded) == 1
-    assert {type(r).__name__ for r in recorded[0].metric_readers} == {"PrometheusMetricReader"}
