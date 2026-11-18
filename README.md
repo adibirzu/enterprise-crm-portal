@@ -93,6 +93,14 @@ Each observability service is **independently activatable** — deploy the app f
 | **Prometheus** | Always enabled | `/metrics` endpoint for Grafana |
 | **Splunk HEC** | `SPLUNK_HEC_URL`, `SPLUNK_HEC_TOKEN` | External SIEM forwarding |
 
+### Metrics Export Note
+
+OCI APM is used for traces and RUM. The CRM runtime does not export OTLP
+metrics directly to the APM endpoint because the current endpoint path returns
+`404` for metric ingestion. Metrics remain available through Prometheus
+`/metrics`; platform alarms can use OCI Monitoring custom metrics where
+configured.
+
 ### Minimal Deploy (No Observability)
 
 ```bash
