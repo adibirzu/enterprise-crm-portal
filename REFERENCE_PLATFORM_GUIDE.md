@@ -31,11 +31,15 @@ Use placeholders in tracked files. Inject real domains through `DNS_DOMAIN`,
 | --- | --- |
 | CRM public URL | `CRM_BASE_URL` |
 | Shop public or service URL | `OCTO_DRONE_SHOP_URL` |
-| Control plane URL | `CONTROL_PLANE_URL` |
-| Platform backend URL | `PLATFORM_BACKEND_URL` |
+| Control plane URL | `CONTROL_PLANE_URL` (alias `OCI_DEMO_CONTROL_PLANE_URL`) |
+| Platform backend URL | `PLATFORM_BACKEND_URL` (alias `OCI_DEMO_BACKEND_URL`) |
 | Shared DNS suffix | `DNS_DOMAIN` |
 | Bootstrap admin credential | `BOOTSTRAP_ADMIN_PASSWORD` or `BOOTSTRAP_ADMIN_PASSWORD_FILE` |
 | App signing secret | `APP_SECRET_KEY` or `APP_SECRET_KEY_FILE` |
+
+The Platform Control Plane health probe prefers the `OCI_DEMO_*` aliases when
+set: `OCI_DEMO_BACKEND_URL`, then `OCI_DEMO_CONTROL_PLANE_URL` (each falls back
+to its generic variable above), and finally the `cp` host under `DNS_DOMAIN`.
 
 ## Security checklist
 

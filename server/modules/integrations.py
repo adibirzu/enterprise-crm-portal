@@ -121,7 +121,7 @@ def _configured_dependencies() -> list[dict]:
             "display_name": "Platform Control Plane",
             "type": "backend",
             "url": _dns_url("cp") or cfg.control_plane_url,
-            "probe_url": cfg.platform_backend_url or cfg.control_plane_url or _dns_url("cp"),
+            "probe_url": cfg.oci_demo_backend_url or cfg.oci_demo_control_plane_url or _dns_url("cp"),
             "health_paths": ["/health", "/api/health", "/ready"],
             "drilldown_product": "APM",
         },

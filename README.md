@@ -93,6 +93,16 @@ Each observability service is **independently activatable** — deploy the app f
 | **Prometheus** | Always enabled | `/metrics` endpoint for Grafana |
 | **Splunk HEC** | `SPLUNK_HEC_URL`, `SPLUNK_HEC_TOKEN` | External SIEM forwarding |
 
+### Metrics Export Note
+
+OCI APM is used for traces and RUM. The application metrics module no longer
+adds an OTLP metric exporter on the private APM metrics path, because that path
+returned `404` for metric ingestion. Application metrics are served through
+Prometheus `/metrics`; platform alarms can use OCI Monitoring custom metrics
+where configured. When OCI APM is configured, the standalone OpenTelemetry
+initialization still exports process runtime metrics (APM App Servers) over
+OTLP.
+
 ### Minimal Deploy (No Observability)
 
 ```bash

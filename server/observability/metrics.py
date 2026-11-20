@@ -1,6 +1,5 @@
-"""OpenTelemetry Metrics — the missing third pillar of observability.
+"""OpenTelemetry Metrics — Prometheus scrape endpoint and in-process metrics.
 
-Provides both OTLP metric export (to OCI APM) and a Prometheus scrape endpoint.
 This module defines all technical and runtime metrics; business metrics live in
 business_metrics.py to keep concerns separated.
 """
@@ -11,7 +10,6 @@ import time
 
 from opentelemetry import metrics
 from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
 
 from server.config import cfg
@@ -23,7 +21,7 @@ _initialized = False
 
 
 def init_metrics() -> metrics.Meter:
-    """Initialize OTel MeterProvider with Prometheus + optional OTLP export."""
+    """Initialize OTel MeterProvider with Prometheus metrics."""
     global _meter, _initialized
 
     if _initialized and _meter:
@@ -50,22 +48,9 @@ def init_metrics() -> metrics.Meter:
     except ImportError:
         logger.warning("opentelemetry-exporter-prometheus not installed — /metrics disabled")
 
-    # OTLP export to OCI APM (if configured)
-    if cfg.apm_configured:
-        try:
-            from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
-            otlp_endpoint = f"{cfg.oci_apm_endpoint.rstrip('/')}/20200101/opentelemetry/private/v1/metrics"
-            otlp_reader = PeriodicExportingMetricReader(
-                OTLPMetricExporter(
-                    endpoint=otlp_endpoint,
-                    headers={"Authorization": f"dataKey {cfg.oci_apm_private_datakey}"},
-                ),
-                export_interval_millis=15_000,
-            )
-            readers.append(otlp_reader)
-            logger.info("OCI APM OTLP metric exporter configured: %s", otlp_endpoint)
-        except ImportError:
-            logger.warning("OTLP metric exporter not available")
+    # OCI APM supports trace ingestion here, but this deployment's APM endpoint
+    # does not accept OTLP metrics. Keep metrics available via /metrics so
+    # Grafana/scrapers can consume them without producing 404 export noise.
 
     provider = MeterProvider(resource=resource, metric_readers=readers)
     metrics.set_meter_provider(provider)
