@@ -50,8 +50,11 @@ class SessionGateMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
 
-        # Always allow public paths
-        if any(path.startswith(p) for p in _PUBLIC_PREFIXES):
+        if request.method == "GET" and path == "/api/health":
+            return await call_next(request)
+
+        # Browser telemetry requires a session even under the observability prefix.
+        if path.rstrip("/") != "/api/observability/frontend" and path.startswith(_PUBLIC_PREFIXES):
             return await call_next(request)
 
         # Check session cookie. `get_current_user` raises
