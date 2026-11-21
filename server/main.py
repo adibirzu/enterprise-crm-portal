@@ -8,7 +8,6 @@ structured security logging, and chaos engineering capabilities.
 import asyncio
 import logging
 import os
-import time
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, Request
@@ -16,21 +15,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from sqlalchemy import create_engine, text
 
 from server.bootstrap import bootstrap_database
+from server.chaos.admin import router as chaos_admin_router, page_router as chaos_admin_page_router
 from server.config import cfg
 from server.database import engine, get_db
 from server.db_compat import HEALTH_CHECK_SQL
 from server.observability.otel_setup import init_otel, get_tracer
 from server.observability.logging_sdk import push_log
+from server.observability.log_enricher import install_enricher as _install_enricher
 from server.observability.metrics import init_metrics, runtime_metrics
+from server.observability.workflow_context import WorkflowContextMiddleware as _WfCtx
 from server.middleware.tracing import TracingMiddleware
 from server.middleware.metrics_mw import MetricsMiddleware
 from server.middleware.chaos import ChaosMiddleware
 from server.middleware.geo_latency import GeoLatencyMiddleware
 from server.middleware.session_gate import SessionGateMiddleware
 from server.order_sync import sync_external_orders
+from server.security.headers import SecurityHeadersMiddleware as _SecHeaders
+from server.security.request_id import RequestIdMiddleware as _ReqId
 
 # Module routers
 from server.modules.auth import router as auth_router
@@ -118,7 +123,6 @@ app = FastAPI(
 )
 
 # Instrument FastAPI BEFORE adding custom middleware (must happen before startup)
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 FastAPIInstrumentor.instrument_app(app)
 
 # ── Middleware (order matters — outermost first) ─────────────────
@@ -151,10 +155,6 @@ app.add_middleware(SessionGateMiddleware)
 app.add_middleware(MetricsMiddleware)
 app.add_middleware(TracingMiddleware)
 # Security layer (additive).
-from server.security.headers import SecurityHeadersMiddleware as _SecHeaders
-from server.security.request_id import RequestIdMiddleware as _ReqId
-from server.observability.workflow_context import WorkflowContextMiddleware as _WfCtx
-from server.observability.log_enricher import install_enricher as _install_enricher
 _ops_domain = os.getenv("OPS_DOMAIN", "")
 app.add_middleware(
     _SecHeaders,
@@ -211,7 +211,6 @@ app.include_router(observability_router)
 app.include_router(observability_dashboard_router)
 
 # Chaos control surface (CRM only — shop has no write endpoints).
-from server.chaos.admin import router as chaos_admin_router, page_router as chaos_admin_page_router
 app.include_router(chaos_admin_router)
 app.include_router(chaos_admin_page_router)
 
@@ -228,6 +227,7 @@ except ImportError:
 # ── Health & readiness endpoints ─────────────────────────────────
 
 @app.get("/health")
+@app.get("/api/health")
 async def health():
     """Liveness probe — fast, no I/O."""
     return {"status": "ok", "service": cfg.app_name}

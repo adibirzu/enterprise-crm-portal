@@ -108,7 +108,9 @@
         };
     </script>
     <script src="/static/js/app.js"></script>
+    {% if request.state.current_user %}
     <script src="/static/js/observability.js" defer></script>
+    {% endif %}
     {% block scripts %}{% endblock %}
 </body>
 </html>
