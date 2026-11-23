@@ -124,6 +124,7 @@ def security_span(
         try:
             from server.observability.business_metrics import record_security_event
             record_security_event(vuln_type, severity)
-        except Exception:
+        # Metrics may be unavailable during startup; preserve the security span.
+        except Exception:  # noqa: S110
             pass  # metrics not yet initialized during startup
         yield span

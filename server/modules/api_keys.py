@@ -37,7 +37,8 @@ async def generate_api_key(request: Request):
 
         # VULN: Predictable key generation based on timestamp + username
         key_seed = f"{username}{int(time.time())}"
-        api_key = hashlib.md5(key_seed.encode()).hexdigest()
+        # Deliberate predictable-key demo for attack telemetry, not a production credential service.
+        api_key = hashlib.md5(key_seed.encode()).hexdigest()  # noqa: S324  # nosec B324
 
         with security_span("sensitive_data", severity="medium",
                          source_ip=client_ip, username=username,

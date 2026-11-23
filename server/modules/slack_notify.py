@@ -49,7 +49,8 @@ def _trace_id(extra: Optional[Dict[str, Any]]) -> Optional[str]:
         ctx = span.get_span_context() if span else None
         if ctx and ctx.trace_id:
             return format(ctx.trace_id, "032x")
-    except Exception:
+    # Optional trace context must not interrupt notification delivery.
+    except Exception:  # noqa: S110
         pass
     return None
 
