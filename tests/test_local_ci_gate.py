@@ -30,6 +30,7 @@ def invoke(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
         cwd=ROOT,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         capture_output=True,
         text=True,
         check=False,
@@ -182,15 +183,19 @@ def test_allow_online_enforces_outbound_only_sandbox_and_keeps_offline_jobs_deni
     module = load_gate_module()
     monkeypatch.setattr(module, "OUTPUT", str(tmp_path / "gate-out"))
 
+    bound_marker = tmp_path / "bound"
     bind_probe = [
         sys.executable,
         "-c",
-        "import socket; s = socket.socket(); s.bind(('', 0))",
+        "import socket; from pathlib import Path; "
+        "s = socket.socket(); s.bind(('', 0)); "
+        f"Path({str(bound_marker)!r}).touch()",
     ]
     bind_results = module.run_commands(
         [bind_probe], tmp_path / "outbound-bind", network_policy="outbound-permitted"
     )
-    assert bind_results[0]["exit_code"] == 1
+    assert bind_results[0]["exit_code"] in (1, 71)
+    assert not bound_marker.exists()
 
     captured_argvs: list[list[str]] = []
     real_run = subprocess.run
@@ -280,6 +285,9 @@ def test_secret_scan_catches_staged_secret_with_clean_unstaged_diff(
     gate_noise = repo_dir / ".gate" / "local-ci" / "noise.log"
     gate_noise.parent.mkdir(parents=True, exist_ok=True)
     gate_noise.write_text(f"ignored gate artifact {fake_secret}\n", encoding="utf-8")
+    pyc_noise = repo_dir / "server" / "observability" / "__pycache__" / "stub.pyc"
+    pyc_noise.parent.mkdir(parents=True, exist_ok=True)
+    pyc_noise.write_text(f'api_key = "{fake_secret}"\n', encoding="utf-8")
 
     monkeypatch.setattr(module, "ROOT", repo_dir)
     clean_results = module.run_commands(
