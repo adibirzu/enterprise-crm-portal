@@ -36,7 +36,10 @@ INTEGRATION_SCHEMA: dict = {
             "shop at /api/integrations/schema. Both sides require "
             "X-Internal-Service-Key when INTERNAL_SERVICE_KEY is set; "
             "order payloads SHOULD include idempotency_token + "
-            "source_system + source_order_id for retry-safe dedup."
+            "source_system + source_order_id for retry-safe dedup. "
+            "CRM deduplicates by source reference, returns the original result for "
+            "an identical request, and returns HTTP 409 for a changed request. "
+            "The optional token is compared as request metadata, not an independent key."
         ),
     },
     "components": {

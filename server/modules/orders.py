@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hmac
+import json
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from server.config import cfg
@@ -195,14 +197,32 @@ def _require_internal_key_if_configured(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Internal-Service-Key")
 
 
+async def _replay_order(db, source_system: str, source_order_id: str, source_payload: str):
+    result = await db.execute(
+        select(Order).where(
+            Order.source_system == source_system,
+            Order.source_order_id == source_order_id,
+        )
+    )
+    order = result.scalar_one_or_none()
+    if order is None:
+        return None
+    if order.source_payload != source_payload:
+        raise HTTPException(
+            status_code=409,
+            detail="Order source reference already exists with a different request",
+        )
+    return {"status": "created", "order_id": order.id, "total": float(order.total)}
+
+
 @router.post("")
 async def create_order(request: Request):
     """Create order and persist it with server-side total calculation.
 
     When the calling service supplies idempotency metadata
     (``source_system``, ``source_order_id``, ``idempotency_token``) the
-    values are stored verbatim so a retried sync from the shop does
-    not create a duplicate invoice.
+    source reference identifies the order; the request and token are
+    retained in source_payload to distinguish replays from conflicts.
     """
     _require_internal_key_if_configured(request)
     tracer = tracer_fn()
@@ -222,90 +242,112 @@ async def create_order(request: Request):
                 }
             ]
 
-        async with get_db() as db:
-            customer = await db.get(Customer, customer_id) if customer_id else None
-            if customer is None:
-                return {"error": "Customer not found"}
+        payload_source_system = (body.get("source_system") or "").strip()
+        payload_source_order_id = (body.get("source_order_id") or "").strip()
+        source_system = payload_source_system or "enterprise-crm"
+        source_order_id = payload_source_order_id or f"manual-{customer_id}-{uuid4().hex[:12]}"
+        source_payload = json.dumps(
+            {"crm_create_request": {
+                "customer_id": customer_id,
+                "items": items,
+                "notes": body.get("notes", ""),
+                "shipping_address": body.get("shipping_address", ""),
+                "total": body.get("total"),
+                "idempotency_token": body.get("idempotency_token"),
+            }},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
-            product_ids = [int(item.get("product_id") or 0) for item in items if item.get("product_id")]
-            products = {}
-            if product_ids:
-                result = await db.execute(select(Product).where(Product.id.in_(product_ids)))
-                products = {product.id: product for product in result.scalars()}
+        try:
+            async with get_db() as db:
+                if payload_source_order_id:
+                    replay = await _replay_order(db, source_system, source_order_id, source_payload)
+                    if replay is not None:
+                        return replay
 
-            computed_total = 0.0
-            order_items = []
-            for item in items:
-                quantity = int(item.get("quantity") or 0)
-                if quantity <= 0:
-                    with security_span("mass_assignment", severity="high", payload=str(item), source_ip=client_ip):
+                customer = await db.get(Customer, customer_id) if customer_id else None
+                if customer is None:
+                    return {"error": "Customer not found"}
+
+                product_ids = [int(item.get("product_id") or 0) for item in items if item.get("product_id")]
+                products = {}
+                if product_ids:
+                    result = await db.execute(select(Product).where(Product.id.in_(product_ids)))
+                    products = {product.id: product for product in result.scalars()}
+
+                computed_total = 0.0
+                order_items = []
+                for item in items:
+                    quantity = int(item.get("quantity") or 0)
+                    if quantity <= 0:
+                        with security_span("mass_assignment", severity="high", payload=str(item), source_ip=client_ip):
+                            log_security_event(
+                                "mass_assignment",
+                                "high",
+                                "Invalid quantity detected on order create",
+                                source_ip=client_ip,
+                                payload=str(item),
+                            )
+                        return {"error": "Quantity must be positive"}
+
+                    product = products.get(int(item.get("product_id") or 0))
+                    price = float(product.price if product else item.get("unit_price") or 0.0)
+                    computed_total += quantity * price
+                    order_items.append({"product": product, "quantity": quantity, "unit_price": price})
+
+                client_total = float(body.get("total") or 0.0)
+                if client_total and abs(client_total - computed_total) > 0.01:
+                    with security_span(
+                        "mass_assignment",
+                        severity="critical",
+                        payload=f"client_total={client_total}, computed_total={computed_total}",
+                        source_ip=client_ip,
+                    ):
                         log_security_event(
                             "mass_assignment",
-                            "high",
-                            "Invalid quantity detected on order create",
+                            "critical",
+                            "Order total tampering detected",
                             source_ip=client_ip,
-                            payload=str(item),
+                            payload=f"client_total={client_total}, computed_total={computed_total}",
+                            correlation_id=correlation_id,
                         )
-                    return {"error": "Quantity must be positive"}
 
-                product = products.get(int(item.get("product_id") or 0))
-                price = float(product.price if product else item.get("unit_price") or 0.0)
-                computed_total += quantity * price
-                order_items.append({"product": product, "quantity": quantity, "unit_price": price})
-
-            client_total = float(body.get("total") or 0.0)
-            if client_total and abs(client_total - computed_total) > 0.01:
-                with security_span(
-                    "mass_assignment",
-                    severity="critical",
-                    payload=f"client_total={client_total}, computed_total={computed_total}",
-                    source_ip=client_ip,
-                ):
-                    log_security_event(
-                        "mass_assignment",
-                        "critical",
-                        "Order total tampering detected",
-                        source_ip=client_ip,
-                        payload=f"client_total={client_total}, computed_total={computed_total}",
-                        correlation_id=correlation_id,
-                    )
-
-            # Honor idempotency metadata if supplied by the calling
-            # service; otherwise fall back to server-side generation so
-            # direct CRM-UI order creation still works.
-            payload_source_system = (body.get("source_system") or "").strip()
-            payload_source_order_id = (body.get("source_order_id") or "").strip()
-            source_system = payload_source_system or "enterprise-crm"
-            source_order_id = (
-                payload_source_order_id
-                or f"manual-{customer.id}-{uuid4().hex[:12]}"
-            )
-            order = Order(
-                customer_id=customer.id,
-                total=computed_total,
-                status="pending",
-                notes=body.get("notes", ""),
-                shipping_address=body.get("shipping_address", ""),
-                source_system=source_system,
-                source_order_id=source_order_id,
-                source_customer_email=customer.email,
-                sync_status="local",
-                backlog_status="backlog",
-                correlation_id=correlation_id,
-            )
-            db.add(order)
-            await db.flush()
-
-            for item in order_items:
-                db.add(
-                    OrderItem(
-                        order_id=order.id,
-                        product_id=item["product"].id if item["product"] else None,
-                        quantity=item["quantity"],
-                        unit_price=item["unit_price"],
-                    )
+                order = Order(
+                    customer_id=customer.id,
+                    total=computed_total,
+                    status="pending",
+                    notes=body.get("notes", ""),
+                    shipping_address=body.get("shipping_address", ""),
+                    source_system=source_system,
+                    source_order_id=source_order_id,
+                    source_customer_email=customer.email,
+                    sync_status="local",
+                    backlog_status="backlog",
+                    correlation_id=correlation_id,
+                    source_payload=source_payload,
                 )
-            await db.flush()
+                db.add(order)
+                await db.flush()
+
+                for item in order_items:
+                    db.add(
+                        OrderItem(
+                            order_id=order.id,
+                            product_id=item["product"].id if item["product"] else None,
+                            quantity=item["quantity"],
+                            unit_price=item["unit_price"],
+                        )
+                    )
+                await db.flush()
+
+        except IntegrityError:
+            if payload_source_order_id:
+                async with get_db() as db:
+                    replay = await _replay_order(db, source_system, source_order_id, source_payload)
+                    if replay is not None:
+                        return replay
+            raise
 
         business_metrics.record_order_created(computed_total, source="enterprise-crm")
         push_log(
