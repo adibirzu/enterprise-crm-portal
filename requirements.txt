@@ -21,7 +21,7 @@ opentelemetry-instrumentation-httpx==0.66b2
 opentelemetry-instrumentation-logging==0.66b2
 opentelemetry-exporter-prometheus==0.66b2
 prometheus-client==0.25.0
-oci==2.172.0
+oci==2.184.1
 pydantic==2.13.3
 pydantic-settings==2.14.0
 itsdangerous==2.2.0
@@ -38,3 +38,6 @@ redis[hiredis]>=5.0,<6.0
 
 # Alembic — schema migrations against ATP / local Postgres
 alembic>=1.13,<2.0
+
+# Security-fixed cryptography version, compatible with the OCI SDK above.
+cryptography==50.0.0
