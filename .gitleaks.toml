@@ -1,0 +1,14 @@
+title = "CRM secret scanning"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Synthetic idempotency UUID in the published contract example only"
+condition = "AND"
+regexTarget = "line"
+paths = ['^docs-site/integrations/cross-service-contract\.md$']
+regexes = ['^\s*\"idempotency_token\":\s*\"5e1a6db6-8c0e-5f1c-9c9a-3b0c2a1f0f01\"\s*,?\s*$']
