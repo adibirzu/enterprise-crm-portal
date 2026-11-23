@@ -46,10 +46,26 @@ every order sync:
   namespace UUID forever to guarantee retries regenerate the same
   token.
 
-CRM honors these fields verbatim instead of generating a new
-`source_order_id`. A unique composite DB index on
-`(source_system, source_order_id)` (or `idempotency_token`) is the
-recommended way to enforce dedup at the persistence layer.
+CRM uses `(source_system, source_order_id)` as the deduplication key,
+enforced by the existing unique composite DB constraint. With a supplied
+`source_order_id`, repeating the same request returns HTTP 200 with the
+same response shape (`status: created`, original `order_id` and `total`), including after a concurrent
+insert wins the uniqueness race. Replays do not emit another order-created metric.
+
+CRM stores the request fields and optional `idempotency_token` in the
+existing `source_payload` column. JSON object key order is ignored; item
+array order and numeric JSON representation are preserved. Numeric strings
+and JSON numbers, or `10` and `10.0`, are distinct request values. Changing customer, items, notes, shipping address,
+client total or token for the same source reference returns HTTP 409.
+The token is compared as request metadata, not used as an independent key.
+Omitting it on every attempt remains supported. Requests without a source
+order ID keep generating a fresh manual reference on each call.
+
+Existing rows without this request snapshot return HTTP 409 because CRM
+cannot establish payload equality. No database migration or historical
+backfill is included. The original stored total is replayed even when
+catalog prices have changed. Database deployment and release acceptance
+require separate verification.
 
 ## Env var harmonization
 

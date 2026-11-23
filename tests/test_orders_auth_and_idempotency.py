@@ -35,6 +35,9 @@ class _FakeScalarResult:
     def __init__(self, items: Iterable[Any]):
         self._items = list(items)
 
+    def scalar_one_or_none(self):
+        return next(iter(self._items), None)
+
     def scalars(self):
         return self
 

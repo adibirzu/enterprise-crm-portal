@@ -22,7 +22,7 @@ def replay_client(tmp_path, monkeypatch):
         db.add(Customer(id=2, name="Other buyer", email="other@example.invalid"))
         db.add(Product(id=1, name="Item", sku="item", price=10))
         db.commit()
-    state = {"hide_lookup": False}
+    state = {"hide_lookup": False, "defer_flush": False, "unrelated_failure": False}
 
     class AsyncDb:
         def __init__(self, db):
@@ -41,6 +41,11 @@ def replay_client(tmp_path, monkeypatch):
             self.db.add(obj)
 
         async def flush(self):
+            if state["defer_flush"]:
+                return
+            if state["unrelated_failure"]:
+                state["unrelated_failure"] = False
+                self.db.add(Customer(id=1, name="Duplicate", email="duplicate@example.invalid"))
             self.db.flush()
 
     @asynccontextmanager
@@ -77,12 +82,13 @@ def payload():
     }
 
 
-@pytest.mark.parametrize("race", [False, True], ids=["replay", "uniqueness-race"])
+@pytest.mark.parametrize("race", ["replay", "flush", "commit"])
 def test_same_request_returns_original_without_duplicate(replay_client, race):
     client, engine, state = replay_client
     first = client.post("/api/orders", json=payload())
     assert first.status_code == 200
-    state["hide_lookup"] = race
+    state["hide_lookup"] = race != "replay"
+    state["defer_flush"] = race == "commit"
     second = client.post("/api/orders", json=payload())
     assert second.status_code == 200, second.text
     assert second.json() == first.json()
@@ -93,7 +99,7 @@ def test_same_request_returns_original_without_duplicate(replay_client, race):
 
 
 @pytest.mark.parametrize("field,value", [
-    ("customer_id", 2), ("notes", "Changed"), ("shipping_address", "Changed"),
+    ("total", 123), ("customer_id", 2), ("notes", "Changed"), ("shipping_address", "Changed"),
     ("items", [{"product_id": 1, "quantity": 3, "unit_price": 10}]),
     ("idempotency_token", "00000000-0000-0000-0000-000000000002"),
 ])
@@ -134,3 +140,42 @@ def test_source_reference_is_scoped_by_source_and_manual_orders_stay_distinct(re
     fourth = client.post("/api/orders", json=manual)
     assert all(r.status_code == 200 for r in [first, second, third, fourth])
     assert len({r.json()["order_id"] for r in [first, second, third, fourth]}) == 4
+
+
+@pytest.mark.parametrize("source_payload", [None, "{}"])
+def test_legacy_order_without_request_snapshot_conflicts(replay_client, source_payload):
+    client, engine, _ = replay_client
+    with Session(engine) as db:
+        db.add(Order(customer_id=1, total=20, source_system="upstream",
+                     source_order_id="order-1", source_payload=source_payload))
+        db.commit()
+    assert client.post("/api/orders", json=payload()).status_code == 409
+
+
+def test_unrelated_integrity_failure_rolls_back_and_does_not_replay(replay_client):
+    client, engine, state = replay_client
+    state["unrelated_failure"] = True
+    assert client.post("/api/orders", json=payload()).status_code == 500
+    with Session(engine) as db:
+        assert db.scalar(select(func.count()).select_from(Order)) == 0
+        assert db.scalar(select(func.count()).select_from(OrderItem)) == 0
+    orders.business_metrics.record_order_created.assert_not_called()
+
+
+def test_optional_token_default_source_and_fractional_price(replay_client):
+    client, engine, _ = replay_client
+    request = payload()
+    request.pop("idempotency_token")
+    request.pop("source_system")
+    request["items"][0]["quantity"] = 3
+    with Session(engine) as db:
+        db.get(Product, 1).price = 0.1
+        db.commit()
+    first = client.post("/api/orders", json=request)
+    second = client.post("/api/orders", json=request)
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json()
+    with Session(engine) as db:
+        order = db.scalar(select(Order))
+        assert order.source_system == "enterprise-crm"
+        assert order.total == pytest.approx(0.3)
