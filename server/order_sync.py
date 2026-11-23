@@ -408,7 +408,7 @@ async def _resolve_product(session, item: dict[str, Any], product_cache: dict[st
         return product
 
     base_name = item.get("product_name") or "Synced Item"
-    digest = hashlib.md5((ref or base_name).encode("utf-8")).hexdigest()[:8].upper()
+    digest = hashlib.md5((ref or base_name).encode("utf-8"), usedforsecurity=False).hexdigest()[:8].upper()
     sku = f"SYNC-{digest}"
     product = Product(
         name=base_name,

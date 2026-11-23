@@ -116,7 +116,8 @@ async def import_report_config(request: Request):
         try:
             # VULN: Insecure deserialization — pickle.loads on user data
             decoded = base64.b64decode(encoded_data)
-            config = pickle.loads(decoded)  # CRITICAL VULN
+            # Deliberate deserialization/export demo; preserve attack telemetry exercises.
+            config = pickle.loads(decoded)  # noqa: S301  # nosec B301
             return {"status": "imported", "config": str(config)}
         except Exception as e:
             return {"error": f"Import failed: {str(e)}"}
@@ -146,7 +147,8 @@ async def export_report(
         # VULN: Shell command with user input
         cmd = f"echo 'Report {report_id}' | head -1"  # simplified; real vuln would use format
         try:
-            output = subprocess.check_output(cmd, shell=True, timeout=5).decode()  # VULN
+            # Deliberate deserialization/export demo; preserve attack telemetry exercises.
+            output = subprocess.check_output(cmd, shell=True, timeout=5).decode()  # noqa: S602  # nosec B602
         except Exception as e:
             output = str(e)
 

@@ -179,7 +179,8 @@ def _push_to_splunk(level: str, message: str, extra: dict):
             headers={"Authorization": f"Splunk {cfg.splunk_hec_token}"},
             timeout=2.0,
         )
-    except Exception:
+    # Optional log export is best effort; logging here could recurse into the exporter.
+    except Exception:  # noqa: S110
         pass  # fire-and-forget
 
 

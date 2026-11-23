@@ -80,7 +80,8 @@ def _clear_connection(dbapi_connection, connection_record):
                 {"client_id": ""},
             )
             cursor.close()
-    except Exception:
+    # Optional session-tag cleanup must not fail pool checkin.
+    except Exception:  # noqa: S110
         pass
 
 
