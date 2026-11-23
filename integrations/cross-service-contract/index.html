@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.2">
     
     
       
@@ -29,7 +29,7 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
       
       
 
@@ -891,11 +891,11 @@ authoritative reference — the same OpenAPI subset is served at
 <p>The calling service (Drone Shop) supplies the three dedup fields on
 every order sync:</p>
 <div class="highlight"><pre><span></span><code><span class="p">{</span>
-<span class="w">  </span><span class="nt">&quot;customer_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">42</span><span class="p">,</span>
-<span class="w">  </span><span class="nt">&quot;items&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[{</span><span class="nt">&quot;product_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">7</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;quantity&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;unit_price&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">49.99</span><span class="p">}],</span>
-<span class="w">  </span><span class="nt">&quot;source_system&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;octo-drone-shop&quot;</span><span class="p">,</span>
-<span class="w">  </span><span class="nt">&quot;source_order_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;100&quot;</span><span class="p">,</span>
-<span class="w">  </span><span class="nt">&quot;idempotency_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;5e1a6db6-8c0e-5f1c-9c9a-3b0c2a1f0f01&quot;</span>
+<span class="w">  </span><span class="nt">"customer_id"</span><span class="p">:</span><span class="w"> </span><span class="mi">42</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"items"</span><span class="p">:</span><span class="w"> </span><span class="p">[{</span><span class="nt">"product_id"</span><span class="p">:</span><span class="w"> </span><span class="mi">7</span><span class="p">,</span><span class="w"> </span><span class="nt">"quantity"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">"unit_price"</span><span class="p">:</span><span class="w"> </span><span class="mf">49.99</span><span class="p">}],</span>
+<span class="w">  </span><span class="nt">"source_system"</span><span class="p">:</span><span class="w"> </span><span class="s2">"octo-drone-shop"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"source_order_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"100"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"idempotency_token"</span><span class="p">:</span><span class="w"> </span><span class="s2">"5e1a6db6-8c0e-5f1c-9c9a-3b0c2a1f0f01"</span>
 <span class="p">}</span>
 </code></pre></div>
 <ul>
@@ -907,10 +907,24 @@ every order sync:</p>
   namespace UUID forever to guarantee retries regenerate the same
   token.</li>
 </ul>
-<p>CRM honors these fields verbatim instead of generating a new
-<code>source_order_id</code>. A unique composite DB index on
-<code>(source_system, source_order_id)</code> (or <code>idempotency_token</code>) is the
-recommended way to enforce dedup at the persistence layer.</p>
+<p>CRM uses <code>(source_system, source_order_id)</code> as the deduplication key,
+enforced by the existing unique composite DB constraint. With a supplied
+<code>source_order_id</code>, repeating the same request returns HTTP 200 with the
+same response shape (<code>status: created</code>, original <code>order_id</code> and <code>total</code>), including after a concurrent
+insert wins the uniqueness race. Replays do not emit another order-created metric.</p>
+<p>CRM stores the request fields and optional <code>idempotency_token</code> in the
+existing <code>source_payload</code> column. JSON object key order is ignored; item
+array order and numeric JSON representation are preserved. Numeric strings
+and JSON numbers, or <code>10</code> and <code>10.0</code>, are distinct request values. Changing customer, items, notes, shipping address,
+client total or token for the same source reference returns HTTP 409.
+The token is compared as request metadata, not used as an independent key.
+Omitting it on every attempt remains supported. Requests without a source
+order ID keep generating a fresh manual reference on each call.</p>
+<p>Existing rows without this request snapshot return HTTP 409 because CRM
+cannot establish payload equality. No database migration or historical
+backfill is included. The original stored total is replayed even when
+catalog prices have changed. Database deployment and release acceptance
+require separate verification.</p>
 <h2 id="env-var-harmonization">Env var harmonization</h2>
 <table>
 <thead>
@@ -996,10 +1010,10 @@ with a simple <code>jq</code> check before traffic flows.</p>
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.expand", "toc.integrate"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.expand", "toc.integrate"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../../assets/javascripts/bundle.a5f9d56c.min.js"></script>
       
     
   </body>
