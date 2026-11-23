@@ -127,3 +127,23 @@ def test_non_numeric_issued_at_is_rejected(oidc):
     body["iat"] = "invalid"
     token = jwt.encode(body, key, algorithm="RS256", headers={"kid": "current"})
     assert verify(token) is None
+
+
+@pytest.mark.parametrize("audience", [None, "", []], ids=["missing", "empty-string", "empty-list"])
+def test_configured_audience_rejects_missing_or_empty_claim(oidc, audience):
+    key, _, _ = oidc
+    body = claims()
+    if audience is None:
+        body.pop("aud")
+    else:
+        body["aud"] = audience
+    token = jwt.encode(body, key, algorithm="RS256", headers={"kid": "current"})
+    assert verify(token) is None
+
+
+def test_audience_list_containing_configured_client_is_accepted(oidc):
+    key, _, _ = oidc
+    body = claims()
+    body["aud"] = ["crm-client", "another-client"]
+    token = jwt.encode(body, key, algorithm="RS256", headers={"kid": "current"})
+    assert verify(token) == body
