@@ -11,7 +11,10 @@ build/
 .venv311/
 venv/
 .pytest_cache/
+.ruff_cache/
 .state/
+.gate/
+.cache/
 node_modules/
 *.log
 uploads/
