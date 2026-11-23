@@ -3,6 +3,13 @@ title = "CRM secret scanning"
 [extend]
 useDefault = true
 
+[allowlist]
+description = "Ignore gitignored local gate output and virtual environments"
+paths = [
+  '''^(?:\./)?\.(?:gate|cache|venv|venv311)/''',
+  '''^(?:\./)?venv/''',
+]
+
 [[rules]]
 id = "generic-api-key"
 

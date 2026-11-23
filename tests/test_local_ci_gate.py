@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
@@ -14,6 +16,14 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "local_ci_gate.py"
 CONFIG = ROOT / ".no-mistakes.yaml"
+OFFLINE_JOBS = (
+    "unit-tests",
+    "smoke-tests",
+    "python-sast",
+    "secret-scan",
+    "mkdocs-build",
+    "container-scan",
+)
 
 
 def invoke(*args: str) -> subprocess.CompletedProcess[str]:
@@ -36,27 +46,41 @@ def load_gate_module():
     return module
 
 
+def _write_executable(path: Path, content: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
 def test_list_exposes_all_required_gate_checks_without_failure_masking() -> None:
     result = invoke("--list")
     assert result.returncode == 0, result.stderr
     jobs = json.loads(result.stdout)
 
-    expected_jobs = {
-        "unit-tests",
-        "smoke-tests",
-        "python-sast",
-        "dependency-audit",
-        "secret-scan",
-        "mkdocs-build",
-        "container-scan",
-    }
+    expected_jobs = {*OFFLINE_JOBS, "dependency-audit"}
     assert expected_jobs <= set(jobs)
 
-    all_commands = [
-        cmd
-        for row in jobs.values()
-        for cmd in row["commands"]
-    ]
+    for job_name in OFFLINE_JOBS:
+        assert jobs[job_name]["available"] is True
+        assert jobs[job_name]["network"] == "deny"
+
+    assert jobs["dependency-audit"]["available"] is False
+    assert jobs["dependency-audit"]["network"] == "deny"
+    assert jobs["dependency-audit"]["reason"]
+
+    online_list = invoke("--list", "--allow-online")
+    assert online_list.returncode == 0, online_list.stderr
+    online_jobs = json.loads(online_list.stdout)
+    assert online_jobs["dependency-audit"]["available"] is True
+    assert (
+        online_jobs["dependency-audit"]["network"]
+        == "outbound-permitted (inbound/bind denied)"
+    )
+    for job_name in OFFLINE_JOBS:
+        assert online_jobs[job_name]["network"] == "deny"
+
+    all_commands = [cmd for row in jobs.values() for cmd in row["commands"]]
     assert all_commands
 
     for cmd in all_commands:
@@ -65,7 +89,9 @@ def test_list_exposes_all_required_gate_checks_without_failure_masking() -> None
         assert cmd[:2] not in (["sh", "-c"], ["bash", "-c"], ["zsh", "-c"])
 
     assert any(
-        "pytest" in cmd and "tests/test_health.py" in cmd and "tests/test_observability_frontend.py" in cmd
+        "pytest" in cmd
+        and "tests/test_health.py" in cmd
+        and "tests/test_observability_frontend.py" in cmd
         for cmd in jobs["smoke-tests"]["commands"]
     )
     assert any(
@@ -80,17 +106,24 @@ def test_list_exposes_all_required_gate_checks_without_failure_masking() -> None
         cmd[0] == "ruff" and "check" in cmd and "S" in cmd and "server" in cmd
         for cmd in jobs["python-sast"]["commands"]
     )
-    assert ["pip-audit", "-r", "requirements.txt", "--strict"] in jobs["dependency-audit"]["commands"]
+    assert ["pip-audit", "-r", "requirements.txt", "--strict"] in jobs[
+        "dependency-audit"
+    ]["commands"]
     assert any(
         cmd[:3] == ["mkdocs", "build", "--strict"] and "--site-dir" in cmd
         for cmd in jobs["mkdocs-build"]["commands"]
     )
+    assert jobs["secret-scan"]["commands"] == [
+        ["gitleaks", "detect", "--source", ".", "--redact", "--no-banner"],
+        ["gitleaks", "git", "--pre-commit", "--staged", "--redact", "--no-banner"],
+        ["gitleaks", "git", "--pre-commit", "--redact", "--no-banner"],
+        ["gitleaks", "dir", ".", "--redact", "--no-banner"],
+    ]
     assert any(
-        cmd[0] == "gitleaks" and "--redact" in cmd
-        for cmd in jobs["secret-scan"]["commands"]
-    )
-    assert any(
-        cmd[:2] == ["trivy", "config"] and "--exit-code" in cmd and "1" in cmd and "Dockerfile" in cmd
+        cmd[:2] == ["trivy", "config"]
+        and "--exit-code" in cmd
+        and "1" in cmd
+        and "Dockerfile" in cmd
         for cmd in jobs["container-scan"]["commands"]
     )
 
@@ -104,13 +137,272 @@ def test_unknown_job_exits_nonzero_without_writing_receipt(tmp_path: Path) -> No
     assert not receipt.exists()
 
 
-def test_run_commands_retains_exit_codes_strips_cloud_env_and_denies_network(
+def test_default_offline_marks_dependency_audit_unavailable_and_exits_one(
+    tmp_path: Path, monkeypatch
+) -> None:
+    receipt = tmp_path / "offline-audit.json"
+    result = invoke("--job", "dependency-audit", "--receipt", str(receipt))
+    assert result.returncode == 1
+    data = json.loads(receipt.read_text(encoding="utf-8"))
+    assert data["status"] == "failed"
+    assert data["allow_online"] is False
+    assert data["provider_verified"] is False
+    assert data["release_accepted"] is False
+    audit_record = data["jobs"]["dependency-audit"]
+    assert audit_record["status"] == "unavailable"
+    assert audit_record["network"] == "deny"
+    assert audit_record["commands"] == []
+    assert "pip-audit" in audit_record["reason"]
+
+    module = load_gate_module()
+    monkeypatch.setattr(module, "OUTPUT", str(tmp_path / "gate-out"))
+    for job_name in OFFLINE_JOBS:
+        monkeypatch.setitem(
+            module.JOBS,
+            job_name,
+            module.JobSpec(
+                commands=([sys.executable, "-c", "pass"],),
+                network="deny",
+                workflow=f"test:{job_name}",
+            ),
+        )
+    full_receipt = tmp_path / "full-offline.json"
+    full_code = module.main(["--receipt", str(full_receipt)])
+    assert full_code == 1
+    full_data = json.loads(full_receipt.read_text(encoding="utf-8"))
+    assert full_data["status"] == "failed"
+    for job_name in OFFLINE_JOBS:
+        assert full_data["jobs"][job_name]["status"] == "passed"
+    assert full_data["jobs"]["dependency-audit"]["status"] == "unavailable"
+
+
+def test_allow_online_enforces_outbound_only_sandbox_and_keeps_offline_jobs_denied(
     tmp_path: Path, monkeypatch
 ) -> None:
     module = load_gate_module()
-    monkeypatch.setenv("OCI_TENANCY_Probe", "sensitive-value")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "sensitive-aws")
+    monkeypatch.setattr(module, "OUTPUT", str(tmp_path / "gate-out"))
 
+    bind_probe = [
+        sys.executable,
+        "-c",
+        "import socket; s = socket.socket(); s.bind(('', 0))",
+    ]
+    bind_results = module.run_commands(
+        [bind_probe], tmp_path / "outbound-bind", network_policy="outbound-permitted"
+    )
+    assert bind_results[0]["exit_code"] == 1
+
+    captured_argvs: list[list[str]] = []
+    real_run = subprocess.run
+
+    def spy_run(argv, *args, **kwargs):
+        captured_argvs.append([str(part) for part in argv])
+        if any(str(part).endswith("pip-audit") for part in argv):
+            return subprocess.CompletedProcess(argv, 0)
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "run", spy_run)
+    monkeypatch.setitem(
+        module.JOBS,
+        "smoke-tests",
+        module.JobSpec(
+            commands=([sys.executable, "-c", "pass"],),
+            network="deny",
+            workflow="test:smoke",
+        ),
+    )
+
+    receipt = tmp_path / "online-receipt.json"
+    code = module.main(
+        [
+            "--allow-online",
+            "--job",
+            "dependency-audit",
+            "--job",
+            "smoke-tests",
+            "--receipt",
+            str(receipt),
+        ]
+    )
+    assert code == 0
+    assert len(captured_argvs) == 2
+
+    audit_argv, smoke_argv = captured_argvs
+    assert audit_argv[:3] == [
+        "sandbox-exec",
+        "-p",
+        "(version 1) (allow default) (deny network-inbound) (deny network-bind)",
+    ]
+    assert audit_argv[-3:] == ["-r", "requirements.txt", "--strict"]
+    assert smoke_argv[:3] == [
+        "sandbox-exec",
+        "-p",
+        "(version 1) (allow default) (deny network*)",
+    ]
+
+    data = json.loads(receipt.read_text(encoding="utf-8"))
+    assert data["status"] == "passed"
+    assert data["allow_online"] is True
+    assert (
+        data["jobs"]["dependency-audit"]["network"]
+        == "outbound-permitted (inbound/bind denied)"
+    )
+    assert data["jobs"]["smoke-tests"]["network"] == "deny"
+
+
+def test_secret_scan_catches_staged_secret_with_clean_unstaged_diff(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = load_gate_module()
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    shutil.copy2(ROOT / ".gitleaks.toml", repo_dir / ".gitleaks.toml")
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    git("init")
+    git("config", "user.email", "ci-test@example.invalid")
+    git("config", "user.name", "CI Test")
+    (repo_dir / "README.md").write_text("# Clean fixture\n", encoding="utf-8")
+    git("add", "README.md", ".gitleaks.toml")
+    git("commit", "-m", "chore: initial clean commit")
+
+    fake_secret = "ghp_" + "".join(
+        chr(ord("A") + (i % 26)) if i % 2 == 0 else str(i % 10) for i in range(36)
+    )
+    gate_noise = repo_dir / ".gate" / "local-ci" / "noise.log"
+    gate_noise.parent.mkdir(parents=True, exist_ok=True)
+    gate_noise.write_text(f"ignored gate artifact {fake_secret}\n", encoding="utf-8")
+
+    monkeypatch.setattr(module, "ROOT", repo_dir)
+    clean_results = module.run_commands(
+        module.JOBS["secret-scan"].commands, repo_dir / ".gate" / "clean-logs"
+    )
+    assert [row["exit_code"] for row in clean_results] == [0, 0, 0, 0]
+
+    candidate = repo_dir / "staged_only.py"
+    candidate.write_text(f'TOKEN = "{fake_secret}"\n', encoding="utf-8")
+    git("add", "staged_only.py")
+    unstaged = git("diff")
+    assert unstaged.stdout == ""
+
+    staged_results = module.run_commands(
+        module.JOBS["secret-scan"].commands, repo_dir / ".gate" / "staged-logs"
+    )
+    assert any(row["exit_code"] != 0 for row in staged_results), staged_results
+
+
+def test_environment_precedence_prefers_designated_repo_venv_over_unrelated_venv(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = load_gate_module()
+    fake_root = tmp_path / "repo"
+    fake_root.mkdir()
+    marker = tmp_path / "which-env.txt"
+
+    def make_tool(bin_dir: Path, name: str, label: str) -> Path:
+        script = (
+            "#!/bin/sh\n"
+            f'printf "%s:%s\\n" "{label}" "{name}" >> "{marker}"\n'
+        )
+        return _write_executable(bin_dir / name, script)
+
+    base_root = tmp_path / "base-py"
+    base_bin = base_root / "bin"
+    make_tool(base_bin, "python3", "base")
+    make_tool(base_bin, "bandit", "base")
+
+    unrelated_venv = tmp_path / "unrelated-venv"
+    unrelated_bin = unrelated_venv / "bin"
+    make_tool(unrelated_bin, "python3", "unrelated")
+    make_tool(unrelated_bin, "bandit", "unrelated")
+    make_tool(unrelated_bin, "ruff", "unrelated")
+
+    monkeypatch.setattr(module, "ROOT", fake_root)
+    monkeypatch.setattr(module.sys, "executable", str(base_bin / "python3"))
+    monkeypatch.setattr(module.sys, "prefix", str(base_root))
+    monkeypatch.setattr(module.sys, "base_prefix", str(base_root))
+    monkeypatch.setenv("PATH", f"{base_bin}{os.pathsep}/usr/bin{os.pathsep}/bin")
+
+    base_res = module.run_commands(
+        [["python3"], ["bandit"], ["definitely-missing-tool-xyz"]],
+        tmp_path / "logs-base",
+    )
+    assert [r["exit_code"] for r in base_res] == [0, 0, 127]
+    assert marker.read_text(encoding="utf-8").splitlines() == [
+        "base:python3",
+        "base:bandit",
+    ]
+
+    marker.unlink()
+    gate_bin = fake_root / ".gate" / "venv" / "bin"
+    make_tool(gate_bin, "python3", "gate-venv")
+    make_tool(gate_bin, "bandit", "gate-venv")
+
+    monkeypatch.setattr(module.sys, "executable", str(unrelated_bin / "python3"))
+    monkeypatch.setattr(module.sys, "prefix", str(unrelated_venv))
+    monkeypatch.setattr(module.sys, "base_prefix", str(base_root))
+    monkeypatch.setenv("VIRTUAL_ENV", str(unrelated_venv))
+    monkeypatch.setenv(
+        "PATH",
+        f"{unrelated_bin}{os.pathsep}{base_bin}{os.pathsep}/usr/bin{os.pathsep}/bin",
+    )
+
+    override_res = module.run_commands(
+        [["python3"], ["bandit"], ["ruff"]],
+        tmp_path / "logs-unrelated",
+    )
+    assert [r["exit_code"] for r in override_res] == [0, 0, 127]
+    assert marker.read_text(encoding="utf-8").splitlines() == [
+        "gate-venv:python3",
+        "gate-venv:bandit",
+    ]
+
+    marker.unlink()
+    make_tool(gate_bin, "ruff", "gate-venv")
+    present_res = module.run_commands([["ruff"]], tmp_path / "logs-present")
+    assert [r["exit_code"] for r in present_res] == [0]
+    assert marker.read_text(encoding="utf-8").splitlines() == ["gate-venv:ruff"]
+
+    marker.unlink()
+    shutil.rmtree(fake_root / ".gate" / "venv")
+    dot_venv_bin = fake_root / ".venv" / "bin"
+    make_tool(dot_venv_bin, "python3", "dot-venv")
+    fallback_res = module.run_commands([["python3"]], tmp_path / "logs-dot-venv")
+    assert [r["exit_code"] for r in fallback_res] == [0]
+    assert marker.read_text(encoding="utf-8").splitlines() == ["dot-venv:python3"]
+
+
+def test_minimal_env_allowlist_strips_secrets_isolates_home_and_creates_atomic_0600_files(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = load_gate_module()
+    monkeypatch.setattr(module, "OUTPUT", str(tmp_path / "gate-out"))
+
+    secret_vars = {
+        "OCI_TENANCY_PROBE": "sensitive-oci",
+        "AWS_SECRET_ACCESS_KEY": "sensitive-aws",
+        "AZURE_CLIENT_SECRET": "sensitive-azure",
+        "GOOGLE_APPLICATION_CREDENTIALS": "/tmp/sensitive-gcp.json",
+        "GH_TOKEN": "sensitive-gh",
+        "GITHUB_TOKEN": "sensitive-github",
+        "ARM_CLIENT_SECRET": "sensitive-arm",
+        "PGPASSWORD": "sensitive-pg",
+        "DB_PASSWORD": "sensitive-db",
+        "PIP_INDEX_URL": "https://private.example.invalid/simple",
+        "UNLISTED_AMBIENT_SECRET": "sensitive-custom",
+    }
+    for key, value in secret_vars.items():
+        monkeypatch.setenv(key, value)
+
+    caller_home = os.path.expanduser("~")
     env_dump = tmp_path / "env.json"
     commands = [
         [sys.executable, "-c", "raise SystemExit(7)"],
@@ -118,29 +410,76 @@ def test_run_commands_retains_exit_codes_strips_cloud_env_and_denies_network(
             sys.executable,
             "-c",
             "import json, os; from pathlib import Path; "
-            f"Path({str(env_dump)!r}).write_text(json.dumps({{"
-            "'has_oci': 'OCI_TENANCY_Probe' in os.environ, "
-            "'has_aws': 'AWS_SECRET_ACCESS_KEY' in os.environ, "
-            "'oci_cfg': os.environ.get('OCI_CONFIG_FILE')"
-            "}))",
+            f"Path({str(env_dump)!r}).write_text(json.dumps(dict(os.environ)))",
         ],
         [sys.executable, "-c", "import socket; s = socket.socket(); s.bind(('', 0))"],
         ["definitely-missing-local-ci-binary-xyz"],
     ]
 
+    open_modes: list[tuple[Path, int]] = []
+    real_os_open = os.open
+
+    def spy_os_open(path, flags, mode=0o777, *args, **kwargs):
+        if flags & os.O_CREAT:
+            open_modes.append((Path(path), mode))
+        return real_os_open(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "open", spy_os_open)
+
     log_dir = tmp_path / "logs"
-    results = module.run_commands(commands, log_dir, isolate_network=True)
+    results = module.run_commands(commands, log_dir)
     assert [row["exit_code"] for row in results] == [7, 0, 1, 127]
 
-    observed_env = json.loads(env_dump.read_text())
-    assert observed_env == {
-        "has_oci": False,
-        "has_aws": False,
-        "oci_cfg": "/dev/null",
+    observed = json.loads(env_dump.read_text(encoding="utf-8"))
+    for forbidden in secret_vars:
+        assert forbidden not in observed, f"Leaked env var: {forbidden}"
+
+    allowed_keys = {
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "TMPDIR",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "HOME",
+        "OCI_AUTH_MODE",
+        "OCI_CONFIG_FILE",
+        "PIP_CONFIG_FILE",
+        "PIP_NO_CACHE_DIR",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONPATH",
+        "__CF_USER_TEXT_ENCODING",
     }
+    assert set(observed) <= allowed_keys
+    assert observed["HOME"] != caller_home
+    assert observed["OCI_CONFIG_FILE"] == "/dev/null"
+
     for row in results:
-        mode = stat.S_IMODE((log_dir / row["log"]).stat().st_mode)
-        assert mode == 0o600
+        log_path = log_dir / row["log"]
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+        assert (log_path, 0o600) in open_modes
+
+    preexisting_receipt = tmp_path / "preexisting-receipt.json"
+    preexisting_receipt.write_text("{}", encoding="utf-8")
+    preexisting_receipt.chmod(0o644)
+    monkeypatch.setitem(
+        module.JOBS,
+        "synthetic-pass",
+        module.JobSpec(
+            commands=([sys.executable, "-c", "pass"],),
+            network="deny",
+            workflow="test:pass",
+        ),
+    )
+    assert (
+        module.main(["--job", "synthetic-pass", "--receipt", str(preexisting_receipt)])
+        == 0
+    )
+    assert stat.S_IMODE(preexisting_receipt.stat().st_mode) == 0o600
+    assert (preexisting_receipt, 0o600) in open_modes
 
 
 def test_cli_writes_private_receipt_and_propagates_pass_and_fail(
@@ -151,8 +490,9 @@ def test_cli_writes_private_receipt_and_propagates_pass_and_fail(
     assert passed.returncode == 0, passed.stderr
     assert stat.S_IMODE(pass_receipt.stat().st_mode) == 0o600
 
-    pass_data = json.loads(pass_receipt.read_text())
+    pass_data = json.loads(pass_receipt.read_text(encoding="utf-8"))
     assert pass_data["status"] == "passed"
+    assert pass_data["allow_online"] is False
     assert pass_data["provider_verified"] is False
     assert pass_data["release_accepted"] is False
     assert pass_data["jobs"]["smoke-tests"]["status"] == "passed"
@@ -163,33 +503,42 @@ def test_cli_writes_private_receipt_and_propagates_pass_and_fail(
     )
 
     module = load_gate_module()
+    monkeypatch.setattr(module, "OUTPUT", str(tmp_path / "gate-out"))
     fail_receipt = tmp_path / "fail-receipt.json"
     monkeypatch.setitem(
         module.JOBS,
         "synthetic-fail",
         module.JobSpec(
-            commands=(([sys.executable, "-c", "raise SystemExit(3)"]),),
+            commands=([sys.executable, "-c", "raise SystemExit(3)"],),
             network="deny",
             workflow="test:synthetic",
         ),
     )
     code = module.main(["--job", "synthetic-fail", "--receipt", str(fail_receipt)])
     assert code == 1
-    fail_data = json.loads(fail_receipt.read_text())
+    fail_data = json.loads(fail_receipt.read_text(encoding="utf-8"))
     assert fail_data["status"] == "failed"
     assert fail_data["jobs"]["synthetic-fail"]["status"] == "failed"
     assert fail_data["jobs"]["synthetic-fail"]["commands"][0]["exit_code"] == 3
 
 
-def test_no_mistakes_config_matches_strict_pilot_schema() -> None:
+def test_no_mistakes_config_matches_strict_pilot_schema_without_allow_online() -> None:
     assert CONFIG.is_file(), f"Missing config: {CONFIG}"
-    config = yaml.safe_load(CONFIG.read_text())
+    config = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
     assert set(config.keys()) == {"commands", "auto_fix"}
     assert set(config["commands"].keys()) == {"test", "lint"}
-    assert config["commands"]["test"] == "python3.11 scripts/local_ci_gate.py"
-    assert config["commands"]["lint"].startswith("python3.11 scripts/local_ci_gate.py --job ")
-    assert "||" not in config["commands"]["test"]
-    assert "||" not in config["commands"]["lint"]
+    assert (
+        config["commands"]["test"]
+        == "python3.11 scripts/local_ci_gate.py --job unit-tests --job smoke-tests "
+        "--job python-sast --job secret-scan --job container-scan --job mkdocs-build"
+    )
+    assert config["commands"]["lint"].startswith(
+        "python3.11 scripts/local_ci_gate.py --job "
+    )
+    for key in ("test", "lint"):
+        assert "--allow-online" not in config["commands"][key]
+        assert "dependency-audit" not in config["commands"][key]
+        assert "||" not in config["commands"][key]
     assert config["auto_fix"] == {"review": 0, "test": 0, "lint": 0}
 
 

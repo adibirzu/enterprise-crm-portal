@@ -1,9 +1,11 @@
 #!/usr/bin/env python3.11
 """Run the local no-mistakes CI gate for enterprise-crm-portal with private receipts.
 
-Offline jobs run inside macOS sandbox-exec with network access denied, a temporary
-HOME, and cloud credentials stripped. Dependency auditing uses read-only advisory
-resolution without failure masking.
+All jobs run inside macOS sandbox-exec with network denied by default, an isolated
+temporary HOME, a minimal environment allowlist, and atomic 0600 logs and receipts.
+Dependency auditing requires explicit --allow-online opt-in, which runs under
+outbound-permitted (inbound/bind denied) sandbox-exec while keeping offline jobs
+strictly network-denied.
 """
 
 from __future__ import annotations
@@ -22,8 +24,44 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ".gate/local-ci"
-PYTHON = Path(sys.executable).name
 SANDBOX_DENY_NET = "(version 1) (allow default) (deny network*)"
+SANDBOX_OUTBOUND_ONLY = (
+    "(version 1) (allow default) (deny network-inbound) (deny network-bind)"
+)
+ONLINE_NETWORK_LABEL = "outbound-permitted (inbound/bind denied)"
+UNAVAILABLE_OFFLINE_AUDIT_REASON = (
+    "pip-audit -r requirements.txt --strict requires outbound network access to "
+    "live advisory registries and creates a temporary pip resolver virtualenv; "
+    "network is denied by default. Pass --allow-online explicitly when approved."
+)
+SAFE_ENV_KEYS = (
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TMPDIR",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+)
+DESIGNATED_VENV_BINS = (
+    Path(".gate") / "venv" / "bin",
+    Path(".venv") / "bin",
+    Path(".venv311") / "bin",
+)
+PYTHON_TOOLS = frozenset(
+    {
+        "python",
+        "python3",
+        "python3.11",
+        "pytest",
+        "bandit",
+        "ruff",
+        "mkdocs",
+        "pip-audit",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -31,20 +69,21 @@ class JobSpec:
     commands: Sequence[Sequence[str]]
     network: str = "deny"
     workflow: str = ""
+    requires_online: bool = False
     available: bool = True
     reason: str | None = None
 
 
 JOBS: dict[str, JobSpec] = {
     "unit-tests": JobSpec(
-        commands=([PYTHON, "-m", "pytest", "-q", "-p", "no:cacheprovider"],),
+        commands=(["python3", "-m", "pytest", "-q", "-p", "no:cacheprovider"],),
         network="deny",
         workflow="local:pytest-full-suite",
     ),
     "smoke-tests": JobSpec(
         commands=(
             [
-                PYTHON,
+                "python3",
                 "-m",
                 "pytest",
                 "-q",
@@ -67,13 +106,23 @@ JOBS: dict[str, JobSpec] = {
     ),
     "dependency-audit": JobSpec(
         commands=(["pip-audit", "-r", "requirements.txt", "--strict"],),
-        network="advisory-fetch",
+        network="deny",
         workflow="security-gates.yml:python-sast(pip-audit)",
+        requires_online=True,
     ),
     "secret-scan": JobSpec(
         commands=(
             ["gitleaks", "detect", "--source", ".", "--redact", "--no-banner"],
+            [
+                "gitleaks",
+                "git",
+                "--pre-commit",
+                "--staged",
+                "--redact",
+                "--no-banner",
+            ],
             ["gitleaks", "git", "--pre-commit", "--redact", "--no-banner"],
+            ["gitleaks", "dir", ".", "--redact", "--no-banner"],
         ),
         network="deny",
         workflow="security-gates.yml:secret-scan",
@@ -134,43 +183,86 @@ EXCLUDED_WORKFLOW_CHECKS: dict[str, dict[str, str]] = {
 }
 
 
-def _preferred_bin_dirs() -> list[str]:
-    current_bin = str(Path(sys.executable).absolute().parent)
-    gate_venv_bin = ROOT / ".gate" / "venv" / "bin"
-    if sys.prefix == sys.base_prefix and gate_venv_bin.is_dir():
-        return [str(gate_venv_bin), current_bin]
-    return [current_bin]
+def _open_private_write(path: Path):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    return os.fdopen(fd, "w", encoding="utf-8")
+
+
+def _designated_venv_bins(root: Path) -> list[Path]:
+    return [
+        (root / rel).absolute()
+        for rel in DESIGNATED_VENV_BINS
+        if (root / rel).is_dir()
+    ]
+
+
+def _resolve_executable(
+    name: str,
+    repo_bins: Sequence[Path],
+    search_path: str,
+) -> str | None:
+    if os.sep in name or (os.altsep and os.altsep in name):
+        candidate = Path(name)
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+        return None
+
+    if repo_bins and name in PYTHON_TOOLS:
+        venv_search = os.pathsep.join(str(p) for p in repo_bins)
+        resolved = shutil.which(name, path=venv_search)
+        if resolved is None and name == "python3":
+            resolved = shutil.which("python", path=venv_search)
+        return resolved
+
+    resolved = shutil.which(name, path=search_path)
+    if resolved is None and name == "python3":
+        fallback = Path(sys.executable).absolute()
+        if fallback.is_file() and os.access(fallback, os.X_OK):
+            return str(fallback)
+    return resolved
+
+
+def _sandbox_profile(network_policy: str) -> str:
+    if network_policy == "deny":
+        return SANDBOX_DENY_NET
+    if network_policy == "outbound-permitted":
+        return SANDBOX_OUTBOUND_ONLY
+    raise ValueError(f"Unsupported network policy: {network_policy}")
 
 
 def run_commands(
     commands: Sequence[Sequence[str]],
     output: Path | str,
     *,
-    isolate_network: bool = True,
+    network_policy: str = "deny",
 ) -> list[dict[str, object]]:
-    """Execute argv commands without a shell and retain every exit code."""
-    if isolate_network and (
-        platform.system() != "Darwin" or not shutil.which("sandbox-exec")
-    ):
+    """Execute argv commands under macOS sandbox-exec and retain every exit code."""
+    profile = _sandbox_profile(network_policy)
+    if platform.system() != "Darwin" or not shutil.which("sandbox-exec"):
         raise RuntimeError("macOS sandbox-exec required; refusing unisolated execution")
 
     output_dir = Path(output)
     output_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(output_dir, 0o700)
 
+    repo_bins = _designated_venv_bins(ROOT)
+    current_bin = Path(sys.executable).absolute().parent
+    prefix_bins = [str(p) for p in repo_bins] if repo_bins else [str(current_bin)]
+
     results: list[dict[str, object]] = []
     with tempfile.TemporaryDirectory(prefix="local-ci-home-") as home:
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if not key.startswith(("OCI_", "AWS_", "AZURE_", "GOOGLE_"))
-        }
+        env: dict[str, str] = {}
+        for key in SAFE_ENV_KEYS:
+            if key in os.environ:
+                env[key] = os.environ[key]
         existing_path = env["PATH"] if "PATH" in env else os.defpath
         env.update(
             HOME=home,
-            PATH=os.pathsep.join([*_preferred_bin_dirs(), existing_path]),
+            PATH=os.pathsep.join([*prefix_bins, existing_path]),
             OCI_AUTH_MODE="config",
             OCI_CONFIG_FILE="/dev/null",
+            PIP_CONFIG_FILE="/dev/null",
             PIP_NO_CACHE_DIR="1",
             PYTHONDONTWRITEBYTECODE="1",
             PYTHONPATH=str(ROOT),
@@ -178,16 +270,19 @@ def run_commands(
         for index, raw_command in enumerate(commands):
             command = [str(part) for part in raw_command]
             log = output_dir / f"{index:02d}.log"
-            with log.open("w", encoding="utf-8") as stream:
-                os.chmod(log, 0o600)
-                resolved = shutil.which(command[0], path=env["PATH"])
+            with _open_private_write(log) as stream:
+                resolved = _resolve_executable(command[0], repo_bins, env["PATH"])
                 if resolved is None:
                     stream.write(f"Local command unavailable: {command[0]}\n")
                     code = 127
                 else:
-                    argv = [resolved, *command[1:]]
-                    if isolate_network:
-                        argv = ["sandbox-exec", "-p", SANDBOX_DENY_NET, *argv]
+                    argv = [
+                        "sandbox-exec",
+                        "-p",
+                        profile,
+                        resolved,
+                        *command[1:],
+                    ]
                     try:
                         proc = subprocess.run(
                             argv,
@@ -201,14 +296,31 @@ def run_commands(
                         code = proc.returncode
                     except (OSError, subprocess.TimeoutExpired) as error:
                         stream.write(f"Local command failed: {type(error).__name__}\n")
-                        code = 124 if isinstance(error, subprocess.TimeoutExpired) else 127
+                        code = (
+                            124
+                            if isinstance(error, subprocess.TimeoutExpired)
+                            else 127
+                        )
             results.append({"command": command, "exit_code": code, "log": log.name})
     return results
+
+
+def _effective_job_state(
+    spec: JobSpec, *, allow_online: bool
+) -> tuple[bool, str, str | None, str]:
+    if not spec.available:
+        return False, spec.network, spec.reason, "deny"
+    if spec.requires_online:
+        if not allow_online:
+            return False, "deny", UNAVAILABLE_OFFLINE_AUDIT_REASON, "deny"
+        return True, ONLINE_NETWORK_LABEL, None, "outbound-permitted"
+    return True, "deny", None, "deny"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true")
+    parser.add_argument("--allow-online", action="store_true")
     parser.add_argument("--job", choices=tuple(JOBS), action="append")
     parser.add_argument(
         "--receipt",
@@ -218,16 +330,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.list:
-        listing = {
-            name: {
+        listing: dict[str, dict[str, object]] = {}
+        for name, spec in JOBS.items():
+            available, network_label, reason, _ = _effective_job_state(
+                spec, allow_online=args.allow_online
+            )
+            listing[name] = {
                 "commands": [list(cmd) for cmd in spec.commands],
-                "available": spec.available,
-                "network": spec.network,
+                "available": available,
+                "network": network_label,
                 "workflow": spec.workflow,
-                "reason": spec.reason,
+                "reason": reason,
             }
-            for name, spec in JOBS.items()
-        }
         print(json.dumps(listing, indent=2))
         return 0
 
@@ -239,12 +353,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     selected_jobs = args.job or list(JOBS)
     for job_name in selected_jobs:
         spec = JOBS[job_name]
-        if not spec.available:
+        available, network_label, reason, network_policy = _effective_job_state(
+            spec, allow_online=args.allow_online
+        )
+        if not available:
             record: dict[str, object] = {
                 "status": "unavailable",
-                "network": spec.network,
+                "network": network_label,
                 "workflow": spec.workflow,
-                "reason": spec.reason,
+                "reason": reason,
                 "commands": [],
             }
         else:
@@ -252,19 +369,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 results = run_commands(
                     spec.commands,
                     output_root / job_name,
-                    isolate_network=(spec.network == "deny"),
+                    network_policy=network_policy,
                 )
                 passed = bool(results) and all(r["exit_code"] == 0 for r in results)
                 record = {
                     "status": "passed" if passed else "failed",
-                    "network": spec.network,
+                    "network": network_label,
                     "workflow": spec.workflow,
                     "commands": results,
                 }
             except RuntimeError as error:
                 record = {
                     "status": "unavailable",
-                    "network": spec.network,
+                    "network": network_label,
                     "workflow": spec.workflow,
                     "reason": str(error),
                     "commands": [],
@@ -276,14 +393,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     receipt = {
         "schema": "enterprise-crm-portal.local-ci/v1",
         "status": "passed" if success else "failed",
+        "allow_online": bool(args.allow_online),
         "provider_verified": False,
         "release_accepted": False,
         "jobs": records,
         "excluded_workflow_checks": EXCLUDED_WORKFLOW_CHECKS,
     }
     args.receipt.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    args.receipt.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
-    os.chmod(args.receipt, 0o600)
+    with _open_private_write(args.receipt) as receipt_stream:
+        receipt_stream.write(json.dumps(receipt, indent=2) + "\n")
     return 0 if success else 1
 
 
