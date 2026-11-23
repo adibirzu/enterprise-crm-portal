@@ -442,8 +442,11 @@ async def _verify_id_token(
             algorithms=[alg],
             audience=expected_audience,
             issuer=expected_issuer,
-            options={"verify_at_hash": False},  # we don't pass access_token
+            options={"verify_at_hash": False, "verify_iat": False},
         )
+        # Preserve prior policy: iat must be numeric but is not a validity bound.
+        if "iat" in claims:
+            int(claims["iat"])
     except jwt.ExpiredSignatureError:
         logger.warning("ID token expired")
         return None

@@ -111,3 +111,19 @@ def test_hmac_with_public_der_key_is_rejected(oidc):
 
 def test_malformed_token_is_rejected(oidc):
     assert verify("malformed") is None
+
+
+def test_future_issued_at_preserves_existing_jose_policy(oidc):
+    key, _, _ = oidc
+    body = claims()
+    body["iat"] = int(time.time()) + 3600
+    token = jwt.encode(body, key, algorithm="RS256", headers={"kid": "current"})
+    assert verify(token) == body
+
+
+def test_non_numeric_issued_at_is_rejected(oidc):
+    key, _, _ = oidc
+    body = claims()
+    body["iat"] = "invalid"
+    token = jwt.encode(body, key, algorithm="RS256", headers={"kid": "current"})
+    assert verify(token) is None
