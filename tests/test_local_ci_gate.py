@@ -6,11 +6,15 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import shutil
+import socket
 import stat
 import subprocess
 import sys
+import tempfile
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +56,16 @@ def _write_executable(path: Path, content: str) -> Path:
     path.write_text(content, encoding="utf-8")
     path.chmod(0o755)
     return path
+
+
+def _require_outer_socket_permission() -> None:
+    """The two live exception tests need an unrestricted parent process."""
+    with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+        with socket.socket(socket.AF_UNIX) as probe:
+            try:
+                probe.bind(str(Path(directory) / "probe.sock"))
+            except PermissionError:
+                pytest.skip("Run this live Seatbelt probe outside the offline aggregate")
 
 
 def test_list_exposes_all_required_gate_checks_without_failure_masking() -> None:
@@ -107,24 +121,31 @@ def test_list_exposes_all_required_gate_checks_without_failure_masking() -> None
         cmd[0] == "ruff" and "check" in cmd and "S" in cmd and "server" in cmd
         for cmd in jobs["python-sast"]["commands"]
     )
-    assert ["pip-audit", "-r", "requirements.txt", "--strict"] in jobs[
-        "dependency-audit"
-    ]["commands"]
+    assert jobs["dependency-audit"]["commands"][0][:4] == [
+        "pip-audit", "-r", "requirements.txt", "--strict"
+    ]
+    assert jobs["node-audit"]["workflow"] == "security-gates.yml:node-audit"
+    assert jobs["node-audit"]["available"] is False
+    assert "lockfile" in online_jobs["node-audit"]["reason"]
+    assert jobs["terraform-lint"]["commands"] == [
+        ["terraform", "-chdir=deploy/terraform", "fmt", "-check", "-recursive"],
+        ["tflint", "--init"],
+        ["tflint", "--chdir=deploy/terraform", "--recursive"],
+    ]
+    semgrep = next(cmd for cmd in jobs["python-sast"]["commands"] if cmd[0] == "semgrep")
+    assert {Path(arg).name for arg in semgrep if arg.startswith(".gate/")} == {
+        "owasp-top-ten.yml", "python.yml", "fastapi.yml"
+    }
     assert any(
         cmd[:3] == ["mkdocs", "build", "--strict"] and "--site-dir" in cmd
         for cmd in jobs["mkdocs-build"]["commands"]
     )
-    assert jobs["secret-scan"]["commands"] == [
-        ["gitleaks", "detect", "--source", ".", "--redact", "--no-banner"],
-        ["gitleaks", "git", "--pre-commit", "--staged", "--redact", "--no-banner"],
-        ["gitleaks", "git", "--pre-commit", "--redact", "--no-banner"],
-        ["gitleaks", "dir", ".", "--redact", "--no-banner"],
-    ]
+    assert jobs["secret-scan"]["commands"][0][-1] == "--added-line-scan"
     assert any(
         cmd[:2] == ["trivy", "config"]
         and "--exit-code" in cmd
         and "1" in cmd
-        and "Dockerfile" in cmd
+        and cmd[-1] == "."
         for cmd in jobs["container-scan"]["commands"]
     )
 
@@ -233,17 +254,10 @@ def test_allow_online_enforces_outbound_only_sandbox_and_keeps_offline_jobs_deni
     assert len(captured_argvs) == 2
 
     audit_argv, smoke_argv = captured_argvs
-    assert audit_argv[:3] == [
-        "sandbox-exec",
-        "-p",
-        "(version 1) (allow default) (deny network-inbound) (deny network-bind)",
-    ]
-    assert audit_argv[-3:] == ["-r", "requirements.txt", "--strict"]
-    assert smoke_argv[:3] == [
-        "sandbox-exec",
-        "-p",
-        "(version 1) (allow default) (deny network*)",
-    ]
+    assert audit_argv[2].startswith("(version 1) (allow default) (deny network*)")
+    assert '(remote tcp "*:443")' in audit_argv[2]
+    assert audit_argv[-2:] == ["--index-url", "https://pypi.org/simple/"]
+    assert smoke_argv[2] == "(version 1) (allow default) (deny network*)"
 
     data = json.loads(receipt.read_text(encoding="utf-8"))
     assert data["status"] == "passed"
@@ -278,6 +292,9 @@ def test_secret_scan_catches_staged_secret_with_clean_unstaged_diff(
     (repo_dir / "README.md").write_text("# Clean fixture\n", encoding="utf-8")
     git("add", "README.md", ".gitleaks.toml")
     git("commit", "-m", "chore: initial clean commit")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    (repo_dir / "scripts").mkdir()
+    shutil.copy2(SCRIPT, repo_dir / "scripts" / SCRIPT.name)
 
     fake_secret = "ghp_" + "".join(
         chr(ord("A") + (i % 26)) if i % 2 == 0 else str(i % 10) for i in range(36)
@@ -293,7 +310,7 @@ def test_secret_scan_catches_staged_secret_with_clean_unstaged_diff(
     clean_results = module.run_commands(
         module.JOBS["secret-scan"].commands, repo_dir / ".gate" / "clean-logs"
     )
-    assert [row["exit_code"] for row in clean_results] == [0, 0, 0, 0]
+    assert [row["exit_code"] for row in clean_results] == [0]
 
     candidate = repo_dir / "staged_only.py"
     candidate.write_text(f'TOKEN = "{fake_secret}"\n', encoding="utf-8")
@@ -304,7 +321,103 @@ def test_secret_scan_catches_staged_secret_with_clean_unstaged_diff(
     staged_results = module.run_commands(
         module.JOBS["secret-scan"].commands, repo_dir / ".gate" / "staged-logs"
     )
-    assert any(row["exit_code"] != 0 for row in staged_results), staged_results
+    assert [row["exit_code"] for row in staged_results] == [1]
+    log = (repo_dir / ".gate/staged-logs" / staged_results[0]["log"]).read_text()
+    assert log.splitlines() == ["staged_only.py:1", "added-line findings: 1"]
+    assert fake_secret not in log
+
+    git("commit", "-m", "synthetic scanner fixture")
+    committed = module.added_line_scan()
+    assert committed == 1
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    assert module.added_line_scan() == 0
+    candidate.write_text(f'TOKEN = "{fake_secret}"\nSECOND = "{fake_secret}"\n')
+    assert module.added_line_scan() == 1
+    git("update-ref", "-d", "refs/remotes/origin/main")
+    assert module.added_line_scan() == 1
+
+
+def test_online_audit_denies_credentials_and_creates_distinct_empty_configs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _require_outer_socket_permission()
+    module = load_gate_module()
+    workspace = tmp_path.resolve() / "workspace"
+    host_home = tmp_path.resolve() / "host-home"
+    workspace.mkdir()
+    host_home.mkdir()
+    credential_paths = [
+        workspace / ".env",
+        workspace / "server/.env.local",
+        workspace / ".npmrc",
+        host_home / ".ssh/canary",
+        host_home / ".config/gh/hosts.yml",
+        host_home / ".netrc",
+        host_home / ".git-credentials",
+    ]
+    for path in credential_paths:
+        path.parent.mkdir(exist_ok=True, parents=True)
+        path.write_text("synthetic marker")
+    ca_bundle = workspace / ".gate/venv/lib/certifi/cacert.pem"
+    ca_bundle.parent.mkdir(parents=True)
+    ca_bundle.write_text("synthetic CA bundle")
+    monkeypatch.setattr(module, "ROOT", workspace)
+    monkeypatch.setattr("pwd.getpwuid", lambda _: SimpleNamespace(pw_dir=str(host_home)))
+    probe = """
+import os
+from pathlib import Path
+import stat
+import sys
+assert Path(sys.argv[1]).read_text() == 'synthetic CA bundle'
+for path in map(Path, sys.argv[2:]):
+    try:
+        path.read_bytes()
+    except PermissionError:
+        continue
+    raise SystemExit(11)
+assert 'PYTHONPATH' not in os.environ
+keys = ('PIP_CONFIG_FILE', 'NPM_CONFIG_USERCONFIG', 'NPM_CONFIG_GLOBALCONFIG')
+configs = {Path(os.environ[key]) for key in keys}
+assert len(configs) == len(keys)
+for config in configs:
+    assert config.is_relative_to(os.environ['HOME'])
+    assert config.read_bytes() == b''
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600
+"""
+    result = module.run_commands(
+        [[sys.executable, "-c", probe, str(ca_bundle), *map(str, credential_paths)]],
+        tmp_path.resolve() / "logs",
+        network_policy="outbound-permitted",
+    )
+    assert result[0]["exit_code"] == 0
+
+
+def test_tflint_can_use_only_its_private_unix_sockets(tmp_path: Path, monkeypatch) -> None:
+    _require_outer_socket_permission()
+    module = load_gate_module()
+    monkeypatch.setattr(module, "ROOT", tmp_path.resolve())
+    tool = _write_executable(
+        tmp_path / ".gate/bin/tflint",
+        f"#!{sys.executable}\n"
+        "import os, socket\n"
+        "with socket.socket(socket.AF_UNIX) as server:\n"
+        "    path = os.path.join(os.environ['TMPDIR'], 'plugin.sock')\n"
+        "    server.bind(path)\n"
+        "    server.listen()\n"
+        "    with socket.socket(socket.AF_UNIX) as client:\n"
+        "        client.connect(path)\n"
+        "for family, address in [(socket.AF_UNIX, 'outside.sock'), "
+        "(socket.AF_INET, ('', 0))]:\n"
+        "    with socket.socket(family) as server:\n"
+        "        try:\n"
+        "            server.bind(address)\n"
+        "        except PermissionError:\n"
+        "            continue\n"
+        "        raise SystemExit(12)\n",
+    )
+    assert tool.is_file()
+    result = module.run_commands([["tflint"]], tmp_path.resolve() / "logs")
+    assert result[0]["exit_code"] == 0
 
 
 def test_environment_precedence_prefers_designated_repo_venv_over_unrelated_venv(
@@ -458,7 +571,10 @@ def test_minimal_env_allowlist_strips_secrets_isolates_home_and_creates_atomic_0
         "PIP_CONFIG_FILE",
         "PIP_NO_CACHE_DIR",
         "PYTHONDONTWRITEBYTECODE",
+        "PYTHONNOUSERSITE",
         "PYTHONPATH",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_GLOBAL",
         "__CF_USER_TEXT_ENCODING",
     }
     assert set(observed) <= allowed_keys
@@ -468,7 +584,11 @@ def test_minimal_env_allowlist_strips_secrets_isolates_home_and_creates_atomic_0
     for row in results:
         log_path = log_dir / row["log"]
         assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
-        assert (log_path, 0o600) in open_modes
+        assert any(
+            mode == 0o600 and temporary.parent == log_path.parent
+            and temporary.name.startswith(f".{log_path.name}.")
+            for temporary, mode in open_modes
+        )
 
     preexisting_receipt = tmp_path / "preexisting-receipt.json"
     preexisting_receipt.write_text("{}", encoding="utf-8")
@@ -487,7 +607,10 @@ def test_minimal_env_allowlist_strips_secrets_isolates_home_and_creates_atomic_0
         == 0
     )
     assert stat.S_IMODE(preexisting_receipt.stat().st_mode) == 0o600
-    assert (preexisting_receipt, 0o600) in open_modes
+    assert any(
+        path.name.startswith(".preexisting-receipt.json.") and mode == 0o600
+        for path, mode in open_modes
+    )
 
 
 def test_cli_writes_private_receipt_and_propagates_pass_and_fail(
@@ -530,22 +653,21 @@ def test_cli_writes_private_receipt_and_propagates_pass_and_fail(
     assert fail_data["jobs"]["synthetic-fail"]["commands"][0]["exit_code"] == 3
 
 
-def test_no_mistakes_config_matches_strict_pilot_schema_without_allow_online() -> None:
+def test_no_mistakes_runs_the_aggregate_with_isolated_audit_and_offline_lint() -> None:
     assert CONFIG.is_file(), f"Missing config: {CONFIG}"
     config = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
     assert set(config.keys()) == {"commands", "auto_fix"}
     assert set(config["commands"].keys()) == {"test", "lint"}
     assert (
         config["commands"]["test"]
-        == "python3.11 scripts/local_ci_gate.py --job unit-tests --job smoke-tests "
-        "--job python-sast --job secret-scan --job container-scan --job mkdocs-build"
+        == "python3.11 scripts/local_ci_gate.py --allow-online"
     )
     assert config["commands"]["lint"].startswith(
         "python3.11 scripts/local_ci_gate.py --job "
     )
+    assert "--allow-online" not in config["commands"]["lint"]
+    assert "dependency-audit" not in config["commands"]["lint"]
     for key in ("test", "lint"):
-        assert "--allow-online" not in config["commands"][key]
-        assert "dependency-audit" not in config["commands"][key]
         assert "||" not in config["commands"][key]
     assert config["auto_fix"] == {"review": 0, "test": 0, "lint": 0}
 

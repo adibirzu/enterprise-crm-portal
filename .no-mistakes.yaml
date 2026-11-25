@@ -1,8 +1,8 @@
-# Pilot only. Remote initialization and publication require separate approval.
+# The test command opts into the isolated dependency audit. Lint runs offline.
 # CI skipping is a run flag (--skip=ci), not a repository configuration key.
 commands:
-  test: python3.11 scripts/local_ci_gate.py --job unit-tests --job smoke-tests --job python-sast --job secret-scan --job container-scan --job mkdocs-build
-  lint: python3.11 scripts/local_ci_gate.py --job python-sast --job secret-scan --job mkdocs-build --job container-scan
+  test: python3.11 scripts/local_ci_gate.py --allow-online
+  lint: python3.11 scripts/local_ci_gate.py --job python-sast --job secret-scan --job terraform-lint --job container-scan --job mkdocs-build
 auto_fix:
   review: 0
   test: 0

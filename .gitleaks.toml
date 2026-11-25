@@ -3,15 +3,6 @@ title = "CRM secret scanning"
 [extend]
 useDefault = true
 
-[allowlist]
-description = "Ignore gitignored local gate output, bytecode caches, and virtual environments"
-paths = [
-  '''(?:^|/)__pycache__/''',
-  '''\.py[co]$''',
-  '''^(?:\./)?\.(?:gate|cache|venv|venv311|pytest_cache|ruff_cache|state)/''',
-  '''^(?:\./)?(?:venv|build|dist|node_modules)/''',
-]
-
 [[rules]]
 id = "generic-api-key"
 

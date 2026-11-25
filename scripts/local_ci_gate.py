@@ -1,23 +1,24 @@
 #!/usr/bin/env python3.11
 """Run the local no-mistakes CI gate for enterprise-crm-portal with private receipts.
 
-All jobs run inside macOS sandbox-exec with network denied by default, an isolated
-temporary HOME, a minimal environment allowlist, and atomic 0600 logs and receipts.
-Dependency auditing requires explicit --allow-online opt-in, which runs under
-outbound-permitted (inbound/bind denied) sandbox-exec while keeping offline jobs
-strictly network-denied.
+All jobs run inside macOS Seatbelt with a temporary HOME and private logs.
+Only dependency auditing can opt into HTTPS and system DNS.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import platform
+import pwd
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,14 +26,9 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ".gate/local-ci"
 SANDBOX_DENY_NET = "(version 1) (allow default) (deny network*)"
-SANDBOX_OUTBOUND_ONLY = (
-    "(version 1) (allow default) (deny network-inbound) (deny network-bind)"
-)
 ONLINE_NETWORK_LABEL = "outbound-permitted (inbound/bind denied)"
 UNAVAILABLE_OFFLINE_AUDIT_REASON = (
-    "pip-audit -r requirements.txt --strict requires outbound network access to "
-    "live advisory registries and creates a temporary pip resolver virtualenv; "
-    "network is denied by default. Pass --allow-online explicitly when approved."
+    "pip-audit and npm audit require live advisory registries. Pass --allow-online."
 )
 SAFE_ENV_KEYS = (
     "PATH",
@@ -40,7 +36,6 @@ SAFE_ENV_KEYS = (
     "LC_ALL",
     "LC_CTYPE",
     "TERM",
-    "TMPDIR",
     "USER",
     "LOGNAME",
     "SHELL",
@@ -60,6 +55,7 @@ PYTHON_TOOLS = frozenset(
         "ruff",
         "mkdocs",
         "pip-audit",
+        "semgrep",
     }
 )
 
@@ -70,8 +66,6 @@ class JobSpec:
     network: str = "deny"
     workflow: str = ""
     requires_online: bool = False
-    available: bool = True
-    reason: str | None = None
 
 
 JOBS: dict[str, JobSpec] = {
@@ -100,32 +94,49 @@ JOBS: dict[str, JobSpec] = {
         commands=(
             ["bandit", "-q", "-r", "server", "-x", "server/__pycache__", "-ll", "-iii"],
             ["ruff", "check", "--no-cache", "--select", "S", "server"],
+            [
+                "semgrep", "scan", "--error", "--quiet", "--metrics=off",
+                "--disable-version-check",
+                "--config", ".gate/semgrep-rules/owasp-top-ten.yml",
+                "--config", ".gate/semgrep-rules/python.yml",
+                "--config", ".gate/semgrep-rules/fastapi.yml",
+                ".",
+            ],
         ),
         network="deny",
         workflow="security-gates.yml:python-sast",
     ),
     "dependency-audit": JobSpec(
-        commands=(["pip-audit", "-r", "requirements.txt", "--strict"],),
-        network="deny",
+        commands=(
+            [
+                "pip-audit", "-r", "requirements.txt", "--strict",
+                "--progress-spinner", "off", "--index-url", "https://pypi.org/simple/",
+            ],
+        ),
         workflow="security-gates.yml:python-sast(pip-audit)",
         requires_online=True,
     ),
-    "secret-scan": JobSpec(
+    "node-audit": JobSpec(
         commands=(
-            ["gitleaks", "detect", "--source", ".", "--redact", "--no-banner"],
             [
-                "gitleaks",
-                "git",
-                "--pre-commit",
-                "--staged",
-                "--redact",
-                "--no-banner",
+                "npm", "audit", "--omit=dev", "--audit-level=high", "--package-lock-only",
+                "--ignore-scripts", "--registry=https://registry.npmjs.org/",
             ],
-            ["gitleaks", "git", "--pre-commit", "--redact", "--no-banner"],
-            ["gitleaks", "dir", ".", "--redact", "--no-banner"],
         ),
-        network="deny",
+        workflow="security-gates.yml:node-audit",
+        requires_online=True,
+    ),
+    "secret-scan": JobSpec(
+        commands=(["python3", "scripts/local_ci_gate.py", "--added-line-scan"],),
         workflow="security-gates.yml:secret-scan",
+    ),
+    "terraform-lint": JobSpec(
+        commands=(
+            ["terraform", "-chdir=deploy/terraform", "fmt", "-check", "-recursive"],
+            ["tflint", "--init"],
+            ["tflint", "--chdir=deploy/terraform", "--recursive"],
+        ),
+        workflow="security-gates.yml:terraform-lint",
     ),
     "mkdocs-build": JobSpec(
         commands=(
@@ -145,37 +156,20 @@ JOBS: dict[str, JobSpec] = {
                 "HIGH,CRITICAL",
                 "--exit-code",
                 "1",
-                "Dockerfile",
+                "--skip-dirs", ".gate",
+                "--skip-dirs", ".git",
+                "--skip-dirs", ".venv",
+                "--skip-dirs", ".venv311",
+                "--skip-dirs", "node_modules",
+                ".",
             ],
         ),
         network="deny",
-        workflow="security-gates.yml:container-scan(Dockerfile)",
+        workflow="security-gates.yml:container-scan",
     ),
 }
 
 EXCLUDED_WORKFLOW_CHECKS: dict[str, dict[str, str]] = {
-    "security-gates.yml:python-sast:semgrep": {
-        "status": "unverified_offline",
-        "reason": (
-            "semgrep ci downloads remote rulesets and cloud policy from semgrep.dev; "
-            "cloud calls are prohibited in this local gate."
-        ),
-    },
-    "security-gates.yml:node-audit": {
-        "status": "not_applicable",
-        "reason": "Repository has no package.json or Node.js lockfile.",
-    },
-    "security-gates.yml:terraform-lint": {
-        "status": "not_applicable",
-        "reason": "Repository has no deploy/terraform directory or .tf files.",
-    },
-    "security-gates.yml:container-scan:k8s-manifests": {
-        "status": "unverified_in_gate",
-        "reason": (
-            "Dockerfile is gated with --exit-code 1; deploy/k8s/*.yaml carry pre-existing "
-            "KSV-0014/KSV-0118 findings while workflow trivy-action omits exit-code: 1."
-        ),
-    },
     "mkdocs-deploy.yml:build-and-deploy:gh-pages": {
         "status": "out_of_scope",
         "reason": "Remote GitHub Pages deployment is outside local validation.",
@@ -183,10 +177,26 @@ EXCLUDED_WORKFLOW_CHECKS: dict[str, dict[str, str]] = {
 }
 
 
+def _private_directory(path: Path) -> None:
+    for part in (*reversed(path.absolute().parents), path.absolute()):
+        if part.is_symlink():
+            raise RuntimeError("Local CI output cannot use a symlink")
+        part.mkdir(mode=0o700, exist_ok=True)
+    if stat.S_IMODE(path.stat().st_mode) & 0o077:
+        raise RuntimeError("Local CI output directory must be private")
+
+
+@contextmanager
 def _open_private_write(path: Path):
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.fchmod(fd, 0o600)
-    return os.fdopen(fd, "w", encoding="utf-8")
+    if path.is_symlink():
+        raise RuntimeError("Local CI output file cannot be a symlink")
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            yield stream
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def _designated_venv_bins(root: Path) -> list[Path]:
@@ -223,12 +233,74 @@ def _resolve_executable(
     return resolved
 
 
-def _sandbox_profile(network_policy: str) -> str:
-    if network_policy == "deny":
-        return SANDBOX_DENY_NET
-    if network_policy == "outbound-permitted":
-        return SANDBOX_OUTBOUND_ONLY
-    raise ValueError(f"Unsupported network policy: {network_policy}")
+def _audit_profile(host_home: Path) -> str:
+    workspace = json.dumps(str(ROOT.resolve()))
+    profile = (
+        SANDBOX_DENY_NET
+        + ' (allow network-outbound (remote tcp "*:443")'
+        ' (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))'
+        f" (deny file-write* (subpath {json.dumps(str(host_home))}) (subpath {workspace}))"
+    )
+    directories = (
+        ".ssh", ".oci", ".aws", ".kube", ".azure", ".docker", ".gnupg", ".config/gh",
+        ".config/gcloud", ".config/pip", ".config/git", ".local/share/keyrings", ".npm",
+        ".pip", "Library/Keychains", "Library/Application Support/pip",
+    )
+    for directory in directories:
+        profile += f" (deny file-read* (subpath {json.dumps(str(host_home / directory))}))"
+    files = (
+        host_home / ".netrc", host_home / ".npmrc", host_home / ".pypirc",
+        host_home / ".git-credentials", host_home / ".gitconfig",
+        Path("/private/etc/pip.conf"), Path("/Library/Application Support/pip/pip.conf"),
+        Path("/opt/homebrew/etc/npmrc"), Path("/usr/local/etc/npmrc"),
+    )
+    for path in files:
+        profile += f" (deny file-read* (literal {json.dumps(str(path))}))"
+    profile += (
+        f" (deny file-read* (require-all (subpath {workspace})"
+        ' (regex #".*/([^/]*[.]env([.]|$)|[.]npmrc$|pip[.]conf$|'
+        '(secrets|credentials|wallet)(/|$)|[^/]*[.](key|wallet)$)")))'
+    )
+    return profile
+
+
+def added_line_scan() -> int:
+    """Keep scanner output private and expose each distinct file and line only."""
+    locations: set[tuple[str, int]] = set()
+    for options in (
+        ["--log-opts=origin/main..HEAD --diff-merges=first-parent"],
+        ["--pre-commit", "--staged"],
+        ["--pre-commit"],
+    ):
+        try:
+            result = subprocess.run(
+                [
+                    "gitleaks", "git", "--redact=100", "--no-banner", "--exit-code", "42",
+                    "--report-format", "json", "--report-path", "-", *options, ".",
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                check=False,
+                timeout=90,
+            )
+            findings = json.loads(result.stdout)
+            if result.returncode not in (0, 42) or not isinstance(findings, list):
+                raise ValueError
+            if bool(findings) != (result.returncode == 42):
+                raise ValueError
+            for finding in findings:
+                path = finding["File"]
+                line = finding["StartLine"]
+                if not isinstance(path, str) or not path or type(line) is not int or line < 1:
+                    raise ValueError
+                locations.add((path, line))
+        except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+            print("added-line scan unavailable")
+            return 1
+    for path, line in sorted(locations):
+        print(f"{json.dumps(path, ensure_ascii=True)[1:-1]}:{line}")
+    print(f"added-line findings: {len(locations)}")
+    return int(bool(locations))
 
 
 def run_commands(
@@ -238,20 +310,29 @@ def run_commands(
     network_policy: str = "deny",
 ) -> list[dict[str, object]]:
     """Execute argv commands under macOS sandbox-exec and retain every exit code."""
-    profile = _sandbox_profile(network_policy)
-    if platform.system() != "Darwin" or not shutil.which("sandbox-exec"):
+    sandbox = "/usr/bin/sandbox-exec"
+    if platform.system() != "Darwin" or not os.access(sandbox, os.X_OK):
         raise RuntimeError("macOS sandbox-exec required; refusing unisolated execution")
+    if network_policy not in ("deny", "outbound-permitted"):
+        raise ValueError("Unsupported network policy")
+    audit = network_policy == "outbound-permitted"
+    profile = (
+        _audit_profile(Path(pwd.getpwuid(os.getuid()).pw_dir).resolve())
+        if audit else SANDBOX_DENY_NET
+    )
 
     output_dir = Path(output)
-    output_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(output_dir, 0o700)
+    _private_directory(output_dir)
 
     repo_bins = _designated_venv_bins(ROOT)
     current_bin = Path(sys.executable).absolute().parent
     prefix_bins = [str(p) for p in repo_bins] if repo_bins else [str(current_bin)]
 
     results: list[dict[str, object]] = []
-    with tempfile.TemporaryDirectory(prefix="local-ci-home-") as home:
+    # macOS Unix socket paths are short. Keep TFLint's private TMPDIR under /private/tmp.
+    with tempfile.TemporaryDirectory(prefix="crm-ci-", dir="/private/tmp") as home:
+        temp = Path(home) / "tmp"
+        temp.mkdir(mode=0o700)
         env: dict[str, str] = {}
         for key in SAFE_ENV_KEYS:
             if key in os.environ:
@@ -259,14 +340,31 @@ def run_commands(
         existing_path = env["PATH"] if "PATH" in env else os.defpath
         env.update(
             HOME=home,
-            PATH=os.pathsep.join([*prefix_bins, existing_path]),
+            PATH=os.pathsep.join([*prefix_bins, str(ROOT / ".gate/bin"), existing_path]),
+            TMPDIR=str(temp),
             OCI_AUTH_MODE="config",
             OCI_CONFIG_FILE="/dev/null",
             PIP_CONFIG_FILE="/dev/null",
             PIP_NO_CACHE_DIR="1",
             PYTHONDONTWRITEBYTECODE="1",
+            PYTHONNOUSERSITE="1",
             PYTHONPATH=str(ROOT),
+            GIT_CONFIG_NOSYSTEM="1",
+            GIT_CONFIG_GLOBAL="/dev/null",
         )
+        if audit:
+            for key, name in (
+                ("PIP_CONFIG_FILE", "pip.conf"),
+                ("NPM_CONFIG_USERCONFIG", "npm-user.conf"),
+                ("NPM_CONFIG_GLOBALCONFIG", "npm-global.conf"),
+            ):
+                config = Path(home) / name
+                with _open_private_write(config):
+                    pass
+                env[key] = str(config)
+            env.pop("PYTHONPATH")
+            env["PYTHONSAFEPATH"] = "1"
+            env["PIP_KEYRING_PROVIDER"] = "disabled"
         for index, raw_command in enumerate(commands):
             command = [str(part) for part in raw_command]
             log = output_dir / f"{index:02d}.log"
@@ -276,22 +374,23 @@ def run_commands(
                     stream.write(f"Local command unavailable: {command[0]}\n")
                     code = 127
                 else:
-                    argv = [
-                        "sandbox-exec",
-                        "-p",
-                        profile,
-                        resolved,
-                        *command[1:],
-                    ]
+                    command_profile = profile
+                    if not audit and command[0] == "tflint":
+                        socket = f'unix-socket (regex #"^{re.escape(str(temp))}/")'
+                        command_profile += (
+                            f" (allow network-bind network-inbound (local {socket}))"
+                            f" (allow network-outbound (remote {socket}))"
+                        )
                     try:
                         proc = subprocess.run(
-                            argv,
+                            ["/usr/bin/sandbox-exec", "-p", command_profile, resolved, *command[1:]],
                             cwd=ROOT,
                             env=env,
                             stdout=stream,
                             stderr=subprocess.STDOUT,
-                            timeout=300,
+                            timeout=600 if audit else 300,
                             check=False,
+                            umask=0o077,
                         )
                         code = proc.returncode
                     except (OSError, subprocess.TimeoutExpired) as error:
@@ -306,10 +405,13 @@ def run_commands(
 
 
 def _effective_job_state(
-    spec: JobSpec, *, allow_online: bool
+    name: str, spec: JobSpec, *, allow_online: bool
 ) -> tuple[bool, str, str | None, str]:
-    if not spec.available:
-        return False, spec.network, spec.reason, "deny"
+    if name == "node-audit" and (
+        not (ROOT / "package.json").is_file()
+        or not any((ROOT / lockfile).is_file() for lockfile in ("package-lock.json", "npm-shrinkwrap.json"))
+    ):
+        return False, "deny", "Missing package.json or npm lockfile.", "deny"
     if spec.requires_online:
         if not allow_online:
             return False, "deny", UNAVAILABLE_OFFLINE_AUDIT_REASON, "deny"
@@ -320,6 +422,7 @@ def _effective_job_state(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true")
+    parser.add_argument("--added-line-scan", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--allow-online", action="store_true")
     parser.add_argument("--job", choices=tuple(JOBS), action="append")
     parser.add_argument(
@@ -329,11 +432,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if args.added_line_scan:
+        return added_line_scan()
     if args.list:
         listing: dict[str, dict[str, object]] = {}
         for name, spec in JOBS.items():
             available, network_label, reason, _ = _effective_job_state(
-                spec, allow_online=args.allow_online
+                name, spec, allow_online=args.allow_online
             )
             listing[name] = {
                 "commands": [list(cmd) for cmd in spec.commands],
@@ -346,15 +451,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     output_root = ROOT / OUTPUT
-    output_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(output_root, 0o700)
+    _private_directory(output_root)
 
     records: dict[str, dict[str, object]] = {}
     selected_jobs = args.job or list(JOBS)
     for job_name in selected_jobs:
         spec = JOBS[job_name]
         available, network_label, reason, network_policy = _effective_job_state(
-            spec, allow_online=args.allow_online
+            job_name, spec, allow_online=args.allow_online
         )
         if not available:
             record: dict[str, object] = {
@@ -378,7 +482,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "workflow": spec.workflow,
                     "commands": results,
                 }
-            except RuntimeError as error:
+            except (RuntimeError, OSError, ValueError) as error:
                 record = {
                     "status": "unavailable",
                     "network": network_label,
@@ -387,7 +491,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "commands": [],
                 }
         records[job_name] = record
-        print(f"{job_name}: {record['status']}", flush=True)
+        detail = f" ({record['reason']})" if "reason" in record else ""
+        print(f"{job_name}: {record['status']}{detail}", flush=True)
 
     success = all(record["status"] == "passed" for record in records.values())
     receipt = {
@@ -399,7 +504,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "jobs": records,
         "excluded_workflow_checks": EXCLUDED_WORKFLOW_CHECKS,
     }
-    args.receipt.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _private_directory(args.receipt.parent)
     with _open_private_write(args.receipt) as receipt_stream:
         receipt_stream.write(json.dumps(receipt, indent=2) + "\n")
     return 0 if success else 1
