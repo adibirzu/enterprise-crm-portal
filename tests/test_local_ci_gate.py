@@ -59,7 +59,7 @@ def _write_executable(path: Path, content: str) -> Path:
 
 
 def _require_outer_socket_permission() -> None:
-    """The two live exception tests need an unrestricted parent process."""
+    """Live Seatbelt exception probes need an unrestricted parent process."""
     with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
         with socket.socket(socket.AF_UNIX) as probe:
             try:
@@ -390,6 +390,38 @@ for config in configs:
         network_policy="outbound-permitted",
     )
     assert result[0]["exit_code"] == 0
+
+
+def test_seatbelt_enforces_outbound_tcp_policy(tmp_path: Path) -> None:
+    if sys.platform != "darwin" or not os.access("/usr/bin/sandbox-exec", os.X_OK):
+        pytest.skip("Live outbound policy probe requires macOS sandbox-exec")
+    _require_outer_socket_permission()
+    module = load_gate_module()
+
+    # Resolve the public audit endpoint before entering Seatbelt. The child only
+    # opens a TCP connection and sends no data.
+    audit_address = socket.gethostbyname("pypi.org")
+    probe = """
+import socket
+import sys
+try:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+        client.settimeout(5)
+        client.connect((sys.argv[1], int(sys.argv[2])))
+except PermissionError:
+    raise SystemExit(42)
+"""
+    commands = [
+        [sys.executable, "-c", probe, audit_address, str(port)]
+        for port in (443, 80)
+    ]
+    offline = module.run_commands(commands, tmp_path / "offline")
+    audit = module.run_commands(
+        commands, tmp_path / "audit", network_policy="outbound-permitted"
+    )
+
+    assert [result["exit_code"] for result in offline] == [42, 42]
+    assert [result["exit_code"] for result in audit] == [0, 42]
 
 
 def test_tflint_can_use_only_its_private_unix_sockets(tmp_path: Path, monkeypatch) -> None:
