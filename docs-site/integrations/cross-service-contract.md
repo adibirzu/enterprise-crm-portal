@@ -19,9 +19,13 @@ X-Internal-Service-Key: <shared-secret>
 - Canonical env var: `INTERNAL_SERVICE_KEY` (both sides).
 - Legacy alias still accepted: `DRONE_SHOP_INTERNAL_KEY` (emits a
   deprecation warning at startup).
-- When the key is set, `POST /api/orders` rejects unauthenticated
-  callers with `401`. When the key is empty the endpoint accepts
-  anonymous traffic — this is the back-compat default.
+- CRM requires either a valid browser session or a matching
+  `X-Internal-Service-Key` on `POST /api/orders`. Configure the same shared key
+  on both services before sending cross-service order traffic. An unset key
+  disables service-key access. Requests without valid credentials receive `401`.
+- CRM customer, order, invoice, ticket, observability and integration data
+  routes require a browser session. Contract discovery at
+  `GET /api/integrations/schema` remains public.
 
 ## Idempotency contract
 

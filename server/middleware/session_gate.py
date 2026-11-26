@@ -1,9 +1,4 @@
-"""Session gate — redirects unauthenticated browser requests to /login.
-
-Bypasses:
-  - /login, /static/*, /health, /ready, /api/auth/*, favicon.ico
-  - API calls (Accept: application/json) — they get 401 instead of redirect
-"""
+"""Require a session for application routes, with explicit public exceptions."""
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -37,24 +32,30 @@ _auth_inflight = asyncio.Semaphore(cfg.auth_executor_max_workers * 2)
 # DB pool_timeout (5s) is the happy-path cap, and this is the circuit-break.
 _AUTH_LOOKUP_TIMEOUT_S = 8.0
 
-# Paths that never require auth
-_PUBLIC_PREFIXES = (
-    "/login", "/static/", "/health", "/ready", "/metrics", "/api/auth/", "/favicon",
-    # Cross-service endpoints used by octo-drone-shop and internal integrations
-    "/api/customers", "/api/invoices", "/api/tickets", "/api/orders",
-    "/api/integrations", "/api/observability/", "/api/analytics/track",
-)
+_PUBLIC_PREFIXES = ("/static/", "/api/auth/")
+_PUBLIC_ROUTES = {
+    ("GET", "/login"),
+    ("GET", "/favicon.ico"),
+    ("GET", "/health"),
+    ("GET", "/api/health"),
+    ("GET", "/ready"),
+    ("GET", "/metrics"),
+    ("GET", "/metrics/"),
+    ("GET", "/api/integrations/schema"),
+    ("POST", "/api/analytics/track"),
+}
 
 
 class SessionGateMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
+        route = (request.method, path)
 
-        if request.method == "GET" and path == "/api/health":
+        if route in _PUBLIC_ROUTES or path.startswith(_PUBLIC_PREFIXES):
             return await call_next(request)
 
-        # Browser telemetry requires a session even under the observability prefix.
-        if path.rstrip("/") != "/api/observability/frontend" and path.startswith(_PUBLIC_PREFIXES):
+        # The order creation handler validates the service key before accessing data.
+        if route == ("POST", "/api/orders") and "x-internal-service-key" in request.headers:
             return await call_next(request)
 
         # Check session cookie. `get_current_user` raises

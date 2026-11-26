@@ -59,13 +59,13 @@ def replay_client(tmp_path, monkeypatch):
                 raise
 
     monkeypatch.setattr(orders, "get_db", get_db)
-    monkeypatch.setattr(orders, "cfg", SimpleNamespace(drone_shop_internal_key=""))
+    monkeypatch.setattr(orders, "cfg", SimpleNamespace(drone_shop_internal_key="example-key"))
     monkeypatch.setattr(orders, "tracer_fn", MagicMock())
     monkeypatch.setattr(orders, "push_log", MagicMock())
     monkeypatch.setattr(orders.business_metrics, "record_order_created", MagicMock())
     app = FastAPI()
     app.include_router(orders.router)
-    with TestClient(app, raise_server_exceptions=False) as client:
+    with TestClient(app, raise_server_exceptions=False, headers={"X-Internal-Service-Key": "example-key"}) as client:
         yield client, engine, state
     engine.dispose()
 
