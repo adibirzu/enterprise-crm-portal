@@ -131,18 +131,18 @@ def test_post_order_accepts_with_valid_key(
     assert resp.status_code == 200
 
 
-@pytest.mark.portability
-def test_post_order_allows_anonymous_when_key_not_configured(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.security
+@pytest.mark.parametrize("headers", [{}, {"X-Internal-Service-Key": "example-key"}])
+def test_post_order_rejects_anonymous_when_key_not_configured(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, headers: dict[str, str]
 ) -> None:
-    """Back-compat: if no key is configured, anonymous POST is still allowed.
-    That is the pre-change behavior; we only add enforcement when opted in."""
     _set_internal_key(monkeypatch, "")
     resp = client.post(
         "/api/orders",
+        headers=headers,
         json={"customer_id": 42, "items": [{"product_id": 1, "quantity": 1, "unit_price": 1.0}]},
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 401
 
 
 @pytest.mark.portability
@@ -152,7 +152,7 @@ def test_post_order_honors_payload_source_order_id(
     """When the calling service supplies source_system + source_order_id,
     CRM must use those values verbatim instead of generating its own.
     That is the basis for dedup across retries."""
-    _set_internal_key(monkeypatch, "")
+    _set_internal_key(monkeypatch, "example-key")
     captured: dict[str, Any] = {}
 
     original_add = _FakeDb.add
@@ -167,6 +167,7 @@ def test_post_order_honors_payload_source_order_id(
 
     resp = client.post(
         "/api/orders",
+        headers={"X-Internal-Service-Key": "example-key"},
         json={
             "customer_id": 42,
             "items": [{"product_id": 1, "quantity": 1, "unit_price": 1.0}],

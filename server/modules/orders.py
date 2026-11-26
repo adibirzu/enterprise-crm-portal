@@ -183,17 +183,15 @@ async def get_order(order_id: int, request: Request):
         return {"order": detail}
 
 
-def _require_internal_key_if_configured(request: Request) -> None:
-    """Enforce X-Internal-Service-Key on cross-service POST /api/orders
-    when the shared key is configured. If the key is empty, allow
-    anonymous traffic (back-compat with deployments that have not yet
-    populated the Kubernetes secret).
-    """
-    required = getattr(cfg, "drone_shop_internal_key", "") or ""
-    if not required:
+def _require_order_auth(request: Request) -> None:
+    """Require a browser session or a configured and matching service key."""
+    if getattr(request.state, "current_user", None):
         return
-    supplied = (request.headers.get("X-Internal-Service-Key") or "").strip()
-    if not supplied or not hmac.compare_digest(supplied, required):
+    required = cfg.drone_shop_internal_key
+    supplied = request.headers.getlist("X-Internal-Service-Key")
+    if not required or len(supplied) != 1 or not hmac.compare_digest(
+        supplied[0].strip().encode(), required.encode()
+    ):
         raise HTTPException(status_code=401, detail="Invalid or missing X-Internal-Service-Key")
 
 
@@ -224,7 +222,7 @@ async def create_order(request: Request):
     source reference identifies the order; the request and token are
     retained in source_payload to distinguish replays from conflicts.
     """
-    _require_internal_key_if_configured(request)
+    _require_order_auth(request)
     tracer = tracer_fn()
     client_ip = request.client.host if request.client else "unknown"
     body = await request.json()

@@ -33,8 +33,8 @@ INTEGRATION_SCHEMA: dict = {
         "version": "1",
         "description": (
             "Cross-service contract. Mirrors the schema published by the "
-            "shop at /api/integrations/schema. Both sides require "
-            "X-Internal-Service-Key when INTERNAL_SERVICE_KEY is set; "
+            "shop at /api/integrations/schema. CRM requires a configured and matching "
+            "X-Internal-Service-Key for cross-service order creation; "
             "order payloads SHOULD include idempotency_token + "
             "source_system + source_order_id for retry-safe dedup. "
             "CRM deduplicates by source reference, returns the original result for "
