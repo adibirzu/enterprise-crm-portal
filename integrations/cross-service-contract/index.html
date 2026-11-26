@@ -883,9 +883,13 @@ authoritative reference — the same OpenAPI subset is served at
 <li>Canonical env var: <code>INTERNAL_SERVICE_KEY</code> (both sides).</li>
 <li>Legacy alias still accepted: <code>DRONE_SHOP_INTERNAL_KEY</code> (emits a
   deprecation warning at startup).</li>
-<li>When the key is set, <code>POST /api/orders</code> rejects unauthenticated
-  callers with <code>401</code>. When the key is empty the endpoint accepts
-  anonymous traffic — this is the back-compat default.</li>
+<li>CRM requires either a valid browser session or a matching
+  <code>X-Internal-Service-Key</code> on <code>POST /api/orders</code>. Configure the same shared key
+  on both services before sending cross-service order traffic. An unset key
+  disables service-key access. Requests without valid credentials receive <code>401</code>.</li>
+<li>CRM customer, order, invoice, ticket, observability and integration data
+  routes require a browser session. Contract discovery at
+  <code>GET /api/integrations/schema</code> remains public.</li>
 </ul>
 <h2 id="idempotency-contract">Idempotency contract</h2>
 <p>The calling service (Drone Shop) supplies the three dedup fields on
