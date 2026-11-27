@@ -15,9 +15,29 @@ spec:
       labels:
         app: enterprise-crm-portal
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
       containers:
         - name: app
-          image: ${OCIR_REGION}.ocir.io/${OCIR_TENANCY}/enterprise-crm-portal:latest
+          image: ""
+          securityContext:
+            capabilities:
+              drop: ["ALL"]
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           ports:
             - containerPort: 8080
           env:
