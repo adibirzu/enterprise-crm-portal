@@ -1,8 +1,14 @@
+import re
 from pathlib import Path
 
 
-def test_checkout_handoff_records_source_and_umbrella_pin():
-    handoff = Path('docs/checkout-ownership.md').read_text()
-    assert '90da4e31dbb2eeba8fd1c8d51c8f8df48b927561' in handoff
-    assert '65d5cdcb449f38d7e31d6ed825942c3d5b273c77' in handoff
+def test_checkout_handoff_records_stable_ownership_contract():
+    handoff = (Path(__file__).resolve().parents[1] / 'docs/checkout-ownership.md').read_text()
+    assert not re.search(r'[0-9a-fA-F]{40}', handoff)
+    assert 'standalone CRM repository as the canonical source' in handoff
+    assert 'external-projects.yaml' in handoff
+    assert 'source of truth for the CRM pin' in handoff
+    assert 'umbrella owner' in handoff
+    assert 'refresh' in handoff
+    assert 'receipt' in handoff
     assert '/api/integrations/schema' in handoff
