@@ -53,7 +53,7 @@ Three supported install paths, same container image on each:
 
 | Path | Entry point | When to use |
 |---|---|---|
-| OKE (Kubernetes) | `deploy/k8s/deployment-atp.yaml` | Production / HA |
+| OKE (Kubernetes) | [Kubernetes deployment](#kubernetes-deployment) | Production / HA |
 | OCI Resource Manager stack | [octo-drone-shop/deploy/resource-manager/](https://github.com/adibirzu/octo-drone-shop/tree/main/deploy/resource-manager) | One-click observability + WAF bootstrap (shared with the shop) |
 | Unified single VM | [octo-drone-shop/deploy/vm/](https://github.com/adibirzu/octo-drone-shop/tree/main/deploy/vm) | Runs shop + CRM on one VM against ATP (demos, workshops, air-gapped) |
 
@@ -217,10 +217,68 @@ When enabled, security probes generate `ATTACK:{TYPE}` spans with MITRE ATT&CK c
 
 ## Kubernetes Deployment
 
-```bash
-kubectl apply -f deploy/k8s/deployment.yaml       # Standard
-kubectl apply -f deploy/k8s/deployment-atp.yaml    # ATP-backed
+Choose `standard` or `atp`. Both variants deploy the same resources under the
+same names. Obtain the approved fully qualified image reference from the release
+record as `registry/repository@sha256:<64 lowercase hex digits>`. Record the
+digest of the image built from this Dockerfile. The source manifests have an
+empty image field and require rendering before use.
+
+From the repository root, load this function in Bash. It checks the image
+reference before emitting any Kubernetes resources. It uses local Kustomize
+rendering through `kubectl` and removes its temporary inputs on exit.
+
+```bash crm-release-render
+render_crm() (
+  set -eu
+  local manifest image="${2:-}" workdir
+  local image_pattern='^[a-z0-9]+(-[a-z0-9]+)*([.][a-z0-9]+(-[a-z0-9]+)*)+(:[0-9]+)?(/[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*)+@sha256:[a-f0-9]{64}$'
+  if [[ ! $image =~ $image_pattern ]]; then
+    printf '%s\n' 'Supply the approved image digest as registry/repository@sha256:<64 lowercase hex digits>.' >&2
+    exit 2
+  fi
+  case "${1:-}" in
+    standard) manifest=deployment.yaml ;;
+    atp) manifest=deployment-atp.yaml ;;
+    *) printf '%s\n' 'Choose standard or atp.' >&2; exit 2 ;;
+  esac
+
+  workdir=$(mktemp -d)
+  trap 'rm -rf -- "$workdir"' EXIT
+  cp deploy/k8s/"$manifest" "$workdir/release-workload.yaml"
+  cp deploy/k8s/kustomization.yaml "$workdir/"
+  printf '%s\n' \
+    'apiVersion: apps/v1' \
+    'kind: Deployment' \
+    'metadata:' \
+    '  name: enterprise-crm-portal' \
+    'spec:' \
+    '  template:' \
+    '    spec:' \
+    '      containers:' \
+    '        - name: app' \
+    "          image: $image" > "$workdir/release-image.yaml"
+  kubectl kustomize "$workdir"
+)
 ```
+
+With `approved_image` set locally, render the chosen variant into a private
+file.
+
+```bash
+release_manifest=$(mktemp) && render_crm atp "$approved_image" > "$release_manifest"
+```
+
+After a successful render, review the output and verify the target context,
+the existing secret, and any ATP configuration. Apply the reviewed file.
+
+```bash
+kubectl apply -f "$release_manifest"
+```
+
+Both workloads run as UID and GID 10001, with a read-only root filesystem and a
+256 MiB pod-local `/tmp` for temporary files, including transient uploads.
+The release check exercises both variants with a synthetic digest and scans
+the rendered YAML for HIGH and CRITICAL configuration findings.
 
 ## Documentation
 

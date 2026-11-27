@@ -16,8 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl && \
     rm -rf /var/lib/apt/lists/*
 
-# Non-root user for container security
-RUN useradd --create-home --shell /bin/bash appuser
+RUN groupadd --gid 10001 appuser && \
+    useradd --uid 10001 --gid 10001 --create-home --shell /bin/bash appuser
 
 COPY --from=builder /install /usr/local
 
@@ -26,7 +26,8 @@ COPY server/ ./server/
 COPY .env.example ./.env.example
 
 RUN chown -R appuser:appuser /app
-USER appuser
+ENV PYTHONDONTWRITEBYTECODE=1
+USER 10001:10001
 
 EXPOSE 8080
 

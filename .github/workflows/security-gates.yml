@@ -5,6 +5,9 @@ on:
     paths:
       - 'server/**'
       - 'deploy/**'
+      - 'Dockerfile'
+      - 'README.md'
+      - 'tests/test_k8s_security_contract.py'
       - 'requirements*.txt'
       - 'package*.json'
       - '.github/workflows/security-gates.yml'
@@ -70,13 +73,33 @@ jobs:
       - run: tflint --chdir=deploy/terraform --recursive
 
   container-scan:
-    runs-on: ubuntu-latest
-    if: ${{ hashFiles('Dockerfile') != '' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify Kubernetes release contract
+        run: |
+          python -m pip install pytest pyyaml==6.0.3
+          python -m pytest -q tests/test_k8s_security_contract.py
+      - name: Render both workloads with a synthetic digest
+        run: |
+          render_dir=$(mktemp -d ./crm-render.XXXXXXXX)
+          awk '$0 == "```bash crm-release-render" { emit=1; next }
+               emit && $0 == "```" { exit }
+               emit' README.md > "$render_dir/render.bash"
+          # shellcheck source=/dev/null
+          source "$render_dir/render.bash"
+          image="registry.example.invalid/team/crm@sha256:$(printf '%064d' 0)"
+          for variant in standard atp; do
+            render_crm "$variant" "$image" > "$render_dir/$variant.yaml"
+          done
       - uses: aquasecurity/trivy-action@0.24.0
         with:
           scan-type: 'config'
           scan-ref: '.'
           severity: 'HIGH,CRITICAL'
-          ignore-unfixed: true
+          exit-code: '1'
