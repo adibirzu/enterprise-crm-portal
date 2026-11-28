@@ -12,6 +12,10 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 # ── Runtime stage: slim image with non-root user ────────────────
 FROM python:3.11-slim
 
+ARG SOURCE_COMMIT
+RUN test "${#SOURCE_COMMIT}" -eq 40 && case "$SOURCE_COMMIT" in *[!0-9a-fA-F]*) exit 1 ;; esac
+ENV SOURCE_COMMIT=${SOURCE_COMMIT}
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl && \
     rm -rf /var/lib/apt/lists/*

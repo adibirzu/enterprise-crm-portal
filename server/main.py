@@ -230,7 +230,9 @@ except ImportError:
 @app.get("/api/health")
 async def health():
     """Liveness probe — fast, no I/O."""
-    return {"status": "ok", "service": cfg.app_name}
+    return {"status": "ok", "service": cfg.app_name, "build": {
+        "source_commit": cfg.source_commit, "version": cfg.build_version,
+    }}
 
 
 @app.get("/api/modules")

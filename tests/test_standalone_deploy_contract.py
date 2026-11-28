@@ -204,3 +204,20 @@ def test_standalone_workload_matches_hardening_and_preserves_atp_contract(deploy
         "httpGet": {"path": "/health", "port": 8080}, "initialDelaySeconds": 30, "periodSeconds": 30,
     }
     assert objects["Service"]["spec"]["type"] == "ClusterIP"
+
+
+def test_build_passes_resolved_source_commit(deploy):
+    result, calls, _ = deploy()
+    assert result.returncode == 0, result.stderr
+    build = next(call for call in calls if call[0] == "docker")
+    expected = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    assert "--build-arg" in build
+    assert build[build.index("--build-arg") + 1] == f"SOURCE_COMMIT={expected}"
+
+
+def test_invalid_source_commit_stops_before_build(deploy):
+    result, calls, objects = deploy(SOURCE_COMMIT="invalid")
+    assert result.returncode != 0
+    assert "SOURCE_COMMIT" in result.stderr
+    assert calls == []
+    assert objects == {}

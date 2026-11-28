@@ -77,6 +77,7 @@ _build_image_digest() (
 
     echo "[standalone] Building and pushing ${IMAGE}:${IMAGE_TAG} for ${IMAGE_PLATFORM}..." >&2
     docker buildx build --platform "$IMAGE_PLATFORM" --tag "${IMAGE}:${IMAGE_TAG}" \
+        --build-arg "SOURCE_COMMIT=${SOURCE_COMMIT}" \
         --push --metadata-file "$metadata_dir/image.json" "$PROJECT_ROOT" >&2 || exit 1
     python3 - "$metadata_dir/image.json" <<'PY'
 import json
@@ -178,6 +179,11 @@ echo ""
 if [[ "${SKIP_BUILD:-}" != "true" ]]; then
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
     PROJECT_ROOT="${SCRIPT_DIR}/../.."
+    SOURCE_COMMIT="${SOURCE_COMMIT:-$(git -C "$PROJECT_ROOT" rev-parse --verify HEAD 2>/dev/null || true)}"
+    if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        echo "ERROR: SOURCE_COMMIT must resolve to a 40-hex commit." >&2
+        exit 1
+    fi
     if ! image_digest="$(_build_image_digest)" || [[ ! "$image_digest" =~ ^${digest_pattern}$ ]]; then
         echo "ERROR: Buildx did not return a valid pushed image digest." >&2
         exit 1
