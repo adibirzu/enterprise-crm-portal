@@ -280,6 +280,26 @@ Both workloads run as UID and GID 10001, with a read-only root filesystem and a
 The release check exercises both variants with a synthetic digest and scans
 the rendered YAML for HIGH and CRITICAL configuration findings.
 
+### Standalone OKE deployment with an ATP wallet
+
+Configure `kubectl` for your target cluster and set the required DNS and ATP
+wallet inputs listed in [the standalone script](deploy/standalone/deploy.sh).
+The script uses a ClusterIP Service and mounts the wallet read-only.
+
+To deploy a prebuilt image, set `approved_image` to its fully qualified
+`registry/repository@sha256:<64 lowercase hex digits>` reference, then run:
+
+```bash
+SKIP_BUILD=true IMAGE_REF="$approved_image" bash deploy/standalone/deploy.sh
+```
+
+To build and push an image, use Docker with Buildx, sign in to OCIR, and set
+`OCIR_REGION` and `OCIR_TENANCY`. Run the same script without `SKIP_BUILD`
+or `IMAGE_REF`. The script pushes a timestamp tag by default, or the tag you
+set in `IMAGE_TAG`. It rejects `latest` and deploys the digest returned by
+Buildx. Set `IMAGE_PLATFORM` to the target Linux platform when running from a
+non-amd64 host, and use a builder that supports that platform.
+
 ## Documentation
 
 | Document | Coverage |
