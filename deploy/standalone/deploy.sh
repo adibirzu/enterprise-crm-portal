@@ -8,8 +8,8 @@
 #   - kubectl configured for your OKE cluster
 #   - Oracle ATP provisioned with a wallet downloaded
 #     (use deploy/oci/ensure_atp.sh to create one if needed)
-#   - OCIR login configured (docker login <region>.ocir.io)
-#   - Docker available for building (or use a pre-built image)
+#   - Python 3 (secret files and build metadata)
+#   - Docker with Buildx and OCIR login for builds (or use a pre-built image)
 #
 # Optional post-deploy:
 #   deploy/oci/ensure_db_observability.sh — enables DB Management + OPSI
@@ -20,8 +20,8 @@
 #   ORACLE_PASSWORD     — ATP admin password
 #   ORACLE_WALLET_DIR   — local path to unzipped wallet
 #   ORACLE_WALLET_PASSWORD — wallet password
-#   OCIR_REGION         — OCI region (e.g., <region-key>)
-#   OCIR_TENANCY        — OCIR tenancy namespace
+#   OCIR_REGION         — OCI region for building (e.g., <region-key>)
+#   OCIR_TENANCY        — OCIR tenancy namespace for building
 #
 # Optional env vars:
 #   IDCS_DOMAIN_URL, IDCS_CLIENT_ID, IDCS_CLIENT_SECRET — enables SSO
@@ -29,7 +29,10 @@
 #   OCTO_DRONE_SHOP_URL — enables order sync integration
 #   INTERNAL_SERVICE_KEY — enables simulation proxy (must match the shop)
 #   NAMESPACE           — k8s namespace (default: enterprise-crm)
-#   IMAGE_TAG           — image tag (default: timestamp)
+#   IMAGE_TAG           — push tag (default: timestamp)
+#   IMAGE_PLATFORM      — Linux target platform (required on non-amd64 hosts)
+#   SKIP_BUILD          — set to true to deploy an existing image
+#   IMAGE_REF           — existing registry/repository@sha256:<digest> when skipping build
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -67,6 +70,25 @@ print(secrets.token_hex(32))
 PY
 }
 
+_build_image_digest() (
+    local metadata_dir
+    metadata_dir="$(mktemp -d)" || exit 1
+    trap 'rm -rf -- "$metadata_dir"' EXIT
+
+    echo "[standalone] Building and pushing ${IMAGE}:${IMAGE_TAG} for ${IMAGE_PLATFORM}..." >&2
+    docker buildx build --platform "$IMAGE_PLATFORM" --tag "${IMAGE}:${IMAGE_TAG}" \
+        --push --metadata-file "$metadata_dir/image.json" "$PROJECT_ROOT" >&2 || exit 1
+    python3 - "$metadata_dir/image.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as metadata:
+    digest = json.load(metadata).get("containerimage.digest")
+if isinstance(digest, str):
+    sys.stdout.write(digest)
+PY
+)
+
 _resolve_secret ORACLE_PASSWORD
 _resolve_secret ORACLE_WALLET_PASSWORD
 _resolve_secret APP_SECRET_KEY
@@ -83,13 +105,50 @@ _require ORACLE_DSN
 _require ORACLE_PASSWORD
 _require ORACLE_WALLET_DIR
 _require ORACLE_WALLET_PASSWORD
-_require OCIR_REGION
-_require OCIR_TENANCY
+
+repository_pattern='[a-z0-9]+(-[a-z0-9]+)*([.][a-z0-9]+(-[a-z0-9]+)*)+(:[0-9]+)?(/[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*)+'
+digest_pattern='sha256:[a-f0-9]{64}'
+if [[ "${SKIP_BUILD:-}" == "true" ]]; then
+    if [[ ! "${IMAGE_REF:-}" =~ ^${repository_pattern}@${digest_pattern}$ ]]; then
+        echo "ERROR: IMAGE_REF must be registry/repository@sha256:<64 lowercase hex digits> when SKIP_BUILD=true." >&2
+        exit 1
+    fi
+    IMAGE_SOURCE="$IMAGE_REF"
+else
+    if [[ -n "${IMAGE_REF:-}" ]]; then
+        echo "ERROR: Set SKIP_BUILD=true to deploy the supplied IMAGE_REF." >&2
+        exit 1
+    fi
+    _require OCIR_REGION
+    _require OCIR_TENANCY
+    IMAGE="${OCIR_REGION}.ocir.io/${OCIR_TENANCY}/enterprise-crm-portal"
+    if [[ ! "$IMAGE" =~ ^${repository_pattern}$ ]]; then
+        echo "ERROR: OCIR_REGION and OCIR_TENANCY must form a valid image repository." >&2
+        exit 1
+    fi
+    IMAGE_TAG="${IMAGE_TAG:-$(date +%Y%m%d%H%M%S)}"
+    if [[ ! "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ || "$IMAGE_TAG" == "latest" ]]; then
+        echo "ERROR: IMAGE_TAG must be a valid push tag other than latest." >&2
+        exit 1
+    fi
+    if [[ -z "${IMAGE_PLATFORM:-}" ]]; then
+        case "$(uname -m)" in
+            amd64|x86_64) IMAGE_PLATFORM=linux/amd64 ;;
+            *)
+                echo "ERROR: IMAGE_PLATFORM is required to build on a non-amd64 host." >&2
+                exit 1
+                ;;
+        esac
+    fi
+    if [[ ! "$IMAGE_PLATFORM" =~ ^linux/[a-z0-9]+(/[a-z0-9]+)?$ ]]; then
+        echo "ERROR: IMAGE_PLATFORM must be an explicit Linux target such as linux/amd64." >&2
+        exit 1
+    fi
+    IMAGE_SOURCE="${IMAGE}:${IMAGE_TAG}"
+fi
 
 NAMESPACE="${NAMESPACE:-enterprise-crm}"
 ORACLE_USER="${ORACLE_USER:-ADMIN}"
-IMAGE_TAG="${IMAGE_TAG:-$(date +%Y%m%d%H%M%S)}"
-IMAGE="${OCIR_REGION}.ocir.io/${OCIR_TENANCY}/enterprise-crm-portal"
 CRM_URL="https://crm.${DNS_DOMAIN}"
 APP_SECRET_KEY="${APP_SECRET_KEY:-$(_generate_secret)}"
 
@@ -106,7 +165,7 @@ echo "║  Enterprise CRM Portal — Standalone Deploy                      ║"
 echo "╠══════════════════════════════════════════════════════════════════╣"
 echo "║  Domain:    ${DNS_DOMAIN}"
 echo "║  CRM URL:   ${CRM_URL}"
-echo "║  Image:     ${IMAGE}:${IMAGE_TAG}"
+echo "║  Image:     ${IMAGE_SOURCE}"
 echo "║  Namespace: ${NAMESPACE}"
 echo "║  ATP DSN:   ${ORACLE_DSN}"
 echo "║  SSO:       ${IDCS_DOMAIN_URL:+enabled}${IDCS_DOMAIN_URL:-disabled (local auth only)}"
@@ -114,6 +173,17 @@ echo "║  APM:       ${OCI_APM_ENDPOINT:+enabled}${OCI_APM_ENDPOINT:-disabled}"
 echo "║  Shop URL:  ${OCTO_DRONE_SHOP_URL:-not configured}"
 echo "╚══════════════════════════════════════════════════════════════════╝"
 echo ""
+
+# Resolve the pushed manifest digest before changing any Kubernetes resources.
+if [[ "${SKIP_BUILD:-}" != "true" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    PROJECT_ROOT="${SCRIPT_DIR}/../.."
+    if ! image_digest="$(_build_image_digest)" || [[ ! "$image_digest" =~ ^${digest_pattern}$ ]]; then
+        echo "ERROR: Buildx did not return a valid pushed image digest." >&2
+        exit 1
+    fi
+    IMAGE_REF="${IMAGE}@${image_digest}"
+fi
 
 # ── Create namespace ──────────────────────────────────────────────
 kubectl create namespace "$NAMESPACE" 2>/dev/null || true
@@ -178,19 +248,9 @@ data:
   OTLP_LOG_EXPORT_ENABLED: "false"
 CONFIGMAP_EOF
 
-# ── Build + push image ───────────────────────────────────────────
-if [[ "${SKIP_BUILD:-}" != "true" ]]; then
-    echo "[standalone] Building image ${IMAGE}:${IMAGE_TAG}..."
-    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    PROJECT_ROOT="${SCRIPT_DIR}/../.."
-    docker build -t "${IMAGE}:${IMAGE_TAG}" -t "${IMAGE}:latest" "${PROJECT_ROOT}"
-    echo "[standalone] Pushing to OCIR..."
-    docker push "${IMAGE}:${IMAGE_TAG}"
-    docker push "${IMAGE}:latest"
-fi
-
 # ── Deploy ────────────────────────────────────────────────────────
-echo "[standalone] Applying deployment..."
+# Match the security settings in deploy/k8s/ and keep the standalone wallet bindings.
+echo "[standalone] Applying deployment with ${IMAGE_REF}..."
 cat <<DEPLOY_EOF | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
@@ -207,9 +267,22 @@ spec:
       labels:
         app: enterprise-crm-portal
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: crm
-        image: ${IMAGE}:${IMAGE_TAG}
+        image: "${IMAGE_REF}"
+        securityContext:
+          capabilities:
+            drop: ["ALL"]
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
         ports:
         - containerPort: 8080
         envFrom:
@@ -221,6 +294,8 @@ spec:
         - name: wallet
           mountPath: /app/wallet
           readOnly: true
+        - name: tmp
+          mountPath: /tmp
         readinessProbe:
           httpGet:
             path: /health
@@ -237,6 +312,9 @@ spec:
       - name: wallet
         secret:
           secretName: crm-wallet
+      - name: tmp
+        emptyDir:
+          sizeLimit: 256Mi
 ---
 apiVersion: v1
 kind: Service
