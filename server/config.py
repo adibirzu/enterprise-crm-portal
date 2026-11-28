@@ -88,6 +88,8 @@ class Config:
     # Application
     app_name: str = field(default_factory=lambda: _env("APP_NAME", "enterprise-crm-portal"))
     brand_name: str = field(default_factory=lambda: _env("BRAND_NAME", "OCTO CRM APM"))
+    source_commit: str = field(default_factory=lambda: _env("SOURCE_COMMIT") or "unknown")
+    build_version: str = field(default_factory=lambda: _env("APP_VERSION") or "unknown")
     app_version: str = field(default_factory=lambda: _env("APP_VERSION", "1.1.0"))
     app_port: int = field(default_factory=lambda: _env_int("APP_PORT", 8080))
     app_env: str = field(default_factory=lambda: _env("APP_ENV", "production"))
